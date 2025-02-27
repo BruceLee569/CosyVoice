@@ -271,19 +271,20 @@ if __name__ == "__main__":
         "--model_dir",
         type=str,
         default="pretrained_models/CosyVoice2-0.5B",
+        # default="/root/autodl-tmp/llm/CosyVoice2-0.5B",
         help="模型本地路径或 modelscope 仓库 id",
     )
     args = parser.parse_args()
 
     try:
-        # cosyvoice = CosyVoice2(args.model_dir, load_jit=True, load_trt=False)
+        # cosyvoice = CosyVoice2(args.model_dir, load_jit=True, load_trt=True, fp16=True)
         # 1、JIT编译对速度影响不大（开了之后前面几次推理会卡慢几秒，十次之后稳定？）
-        # 2、tensorrt对推理加速明显（首次推理还是会慢0.3秒左右），首次加载要等个3分钟左右编译
+        # 2、tensorrt对推理加速明显（首次推理还是会慢0.3秒左右），首次加载trt要等个3分钟左右编译
         # 3、fp16会影响后续推理速度，开启后会快个0.3秒左右
-        # 实测 3090 首包延迟 0.8，后续延迟 0.55，24G显存占用5G，前后编码速度也比4060ti快，前端首包快了将近1秒
-        # 实测 4060 Ti 首包延迟 1.15，后续延迟 0.85，16G显存占用7.5G
-
-        cosyvoice = CosyVoice2(args.model_dir, load_jit=True, load_trt=True, fp16=True)
+        # 实测 3090 首包延迟 0.8 秒，后续延迟 0.55 秒，24G 显存占用 5G，tts前后的文本处理速度也比4060ti快，前端首包快了将近1秒
+        # 实测 4060 Ti 首包延迟 1.15，后续延迟 0.85，16G 显存占用 7.5G
+        # 实测 4090 总体推理速度只比 3090 快个0.2秒，24G 显存占用 8G
+        cosyvoice = CosyVoice2(args.model_dir, load_jit=False, load_trt=True, fp16=True)
     except Exception:
         raise TypeError(f"导入{args.model_dir}失败，模型类型有误！")
 
