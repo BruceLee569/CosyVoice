@@ -1,3 +1,4 @@
+--extra-index-url https://pypi.nvidia.com
 conformer==0.3.2
 deepspeed==0.16.4
 diffusers==0.32.2
@@ -7,6 +8,7 @@ tensorrt==10.8.0.43
 torch==2.3.1
 torchaudio==2.3.1
 transformers==4.49.0
+modelscope==1.23.1
 
 gdown==5.1.0
 gradio==5.4.0
@@ -18,7 +20,7 @@ inflect==7.3.1
 librosa==0.10.2
 lightning==2.2.4
 matplotlib==3.7.5
-modelscope==1.15.0
+
 networkx==3.1
 omegaconf==2.3.0
 
