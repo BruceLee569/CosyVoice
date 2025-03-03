@@ -9,6 +9,7 @@ torch==2.3.1
 torchaudio==2.3.1
 transformers==4.49.0
 modelscope==1.23.1
+pyarrow==19.0.1
 
 gdown==5.1.0
 gradio==5.4.0
