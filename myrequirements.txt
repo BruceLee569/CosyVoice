@@ -1,10 +1,11 @@
---extra-index-url https://pypi.nvidia.com
+#--extra-index-url https://pypi.nvidia.com
 conformer==0.3.2
 deepspeed==0.16.4
 diffusers==0.32.2
 onnx==1.17.0
 onnxruntime-gpu==1.20.1
-tensorrt==10.8.0.43
+#tensorrt==10.8.0.43
+tensorrt
 torch==2.3.1
 torchaudio==2.3.1
 transformers==4.49.0
