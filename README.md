@@ -64,6 +64,24 @@
 
 ## Install
 
+> 📖 **完整的 Ubuntu Server 部署指南**：请查看 [INSTALL_UV.md](./INSTALL_UV.md) 获取详细的 uv 安装步骤、生产部署配置和故障排除。
+
+### 快速安装（推荐 - Ubuntu Server）
+
+使用一键安装脚本：
+
+``` sh
+# 克隆仓库
+git clone --recursive https://github.com/FunAudioLLM/CosyVoice.git
+cd CosyVoice
+
+# 运行一键安装脚本
+chmod +x install_uv.sh
+./install_uv.sh
+
+# 按照脚本输出的提示下载模型和启动服务
+```
+
 ### Clone and install
 
 - Clone the repo
@@ -74,24 +92,78 @@
     git submodule update --init --recursive
     ```
 
-- Install Conda: please see https://docs.conda.io/en/latest/miniconda.html
-- Create Conda env:
+- 安装 uv 包管理器（推荐使用 uv 替代 conda，速度更快）
 
     ``` sh
-    conda create -n cosyvoice -y python=3.10
-    conda activate cosyvoice
-    pip install -r requirements.txt -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
+    # 安装 uv（适用于 Ubuntu Server）
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    
+    # 将 uv 添加到当前会话的 PATH（安装脚本会提示此命令）
+    source $HOME/.local/bin/env
+    
+    # 或者重新登录终端使 PATH 生效
+    ```
 
-    # If you encounter sox compatibility issues
-    # ubuntu
-    sudo apt-get install sox libsox-dev
-    # centos
-    sudo yum install sox sox-devel
+- 安装系统依赖项（Ubuntu Server）
+
+    ``` sh
+    # 更新包列表
+    sudo apt-get update
+    
+    # 安装必要的系统依赖
+    sudo apt-get install -y git git-lfs sox libsox-dev build-essential curl wget ffmpeg unzip
+    
+    # 配置 git-lfs
+    git lfs install
+    ```
+
+- 使用 uv 创建 Python 环境并安装依赖
+
+    ``` sh
+    # 方式 1: 使用安装脚本（推荐）
+    ./install_uv.sh
+    
+    # 方式 2: 手动安装
+    uv venv  # 创建虚拟环境
+    source .venv/bin/activate  # 激活环境
+    
+    # 安装依赖（注意: TensorRT 为可选依赖，某些系统可能安装失败）
+    grep -v "tensorrt" requirements.txt > requirements_temp.txt
+    uv pip install --index-strategy unsafe-best-match -r requirements_temp.txt
+    rm requirements_temp.txt
+    
+    # 或者直接使用 uv run 来运行命令（无需手动激活环境）
+    # 例如: uv run python webui.py
+    ```
+
+    注意：如果使用国内镜像源加速安装，可以配置 pip 镜像：
+    ``` sh
+    mkdir -p ~/.config/pip
+    cat > ~/.config/pip/pip.conf << EOF
+[global]
+index-url = https://mirrors.aliyun.com/pypi/simple/
+trusted-host = mirrors.aliyun.com
+EOF
     ```
 
 ### Model download
 
 We strongly recommend that you download our pretrained `CosyVoice2-0.5B` `CosyVoice-300M` `CosyVoice-300M-SFT` `CosyVoice-300M-Instruct` model and `CosyVoice-ttsfrd` resource.
+
+**方式 1：使用自动下载脚本（推荐）**
+
+``` sh
+# 列出所有可用模型
+uv run python download_models.py --list
+
+# 下载所有模型
+uv run python download_models.py
+
+# 仅下载 CosyVoice 2.0（推荐）
+uv run python download_models.py --model 2.0
+```
+
+**方式 2：使用 Python SDK**
 
 ``` python
 # SDK模型下载
@@ -102,6 +174,8 @@ snapshot_download('iic/CosyVoice-300M-SFT', local_dir='pretrained_models/CosyVoi
 snapshot_download('iic/CosyVoice-300M-Instruct', local_dir='pretrained_models/CosyVoice-300M-Instruct')
 snapshot_download('iic/CosyVoice-ttsfrd', local_dir='pretrained_models/CosyVoice-ttsfrd')
 ```
+
+**方式 3：使用 git 克隆**
 
 ``` sh
 # git模型下载，请确保已安装git lfs
@@ -178,9 +252,10 @@ If you want to use vllm for inference, please install `vllm==v0.9.0`. Older vllm
 Notice that `vllm==v0.9.0` has a lot of specific requirements, for example `torch==2.7.0`. You can create a new env to in case your hardward do not support vllm and old env is corrupted.
 
 ``` sh
-conda create -n cosyvoice_vllm --clone cosyvoice
-conda activate cosyvoice_vllm
-pip install vllm==v0.9.0 transformers==4.51.3 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
+# 为 vllm 创建单独的环境
+uv venv .venv_vllm --python 3.10
+source .venv_vllm/bin/activate
+uv pip install vllm==v0.9.0 transformers==4.51.3 -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host=mirrors.aliyun.com
 python vllm_example.py
 ```
 

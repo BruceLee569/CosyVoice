@@ -50,3 +50,12 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+# uv virtual environment
+.venv/
+.venv_vllm/
+requirements_no_tensorrt.txt
+requirements_temp.txt
+.requirements_temp.txt
+
+*.egg-info/
