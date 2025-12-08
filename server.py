@@ -91,8 +91,8 @@ if __name__ == "__main__":
         # 实测 3090 首包延迟 0.8 秒，后续延迟 0.55 秒，24G 显存占用 5G，tts前后的文本处理速度也比4060ti快，前端首包快了将近1秒
         # 实测 4060 Ti 首包延迟 1.15，后续延迟 0.85，16G 显存占用 7.5G
         # 实测 4090 总体推理速度只比 3090 快个0.2秒，24G 显存占用 8G
-        cosyvoice = CosyVoice2(args.model_dir, load_jit=True, load_trt=False, fp16=True)
-        # cosyvoice = CosyVoice2(args.model_dir, load_jit=False, load_trt=True, fp16=True)
+        cosyvoice = CosyVoice2(args.model_dir, load_jit=False, load_trt=True, fp16=True)
+        # cosyvoice = CosyVoice2(args.model_dir, load_jit=True, load_trt=False, fp16=True)
     except Exception:
         raise TypeError(f"导入{args.model_dir}失败，模型类型有误！")
 

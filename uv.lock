@@ -781,9 +781,9 @@ requires-dist = [
     { name = "rich", specifier = "==13.7.1" },
     { name = "soundfile", specifier = "==0.12.1" },
     { name = "tensorboard", specifier = "==2.14.0" },
-    { name = "tensorrt-cu12", marker = "sys_platform == 'linux' and extra == 'tensorrt'", specifier = "==10.14.1.48" },
-    { name = "tensorrt-cu12-bindings", marker = "sys_platform == 'linux' and extra == 'tensorrt'", specifier = "==10.14.1.48" },
-    { name = "tensorrt-cu12-libs", marker = "sys_platform == 'linux' and extra == 'tensorrt'", specifier = "==10.14.1.48" },
+    { name = "tensorrt-cu12", marker = "sys_platform == 'linux' and extra == 'tensorrt'", specifier = "==10.9.0.34" },
+    { name = "tensorrt-cu12-bindings", marker = "sys_platform == 'linux' and extra == 'tensorrt'", specifier = "==10.9.0.34" },
+    { name = "tensorrt-cu12-libs", marker = "sys_platform == 'linux' and extra == 'tensorrt'", specifier = "==10.9.0.34" },
     { name = "torch", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchaudio", specifier = "==2.9.0", index = "https://download.pytorch.org/whl/cu128" },
     { name = "torchcodec", specifier = "==0.9.0" },
@@ -795,19 +795,6 @@ requires-dist = [
     { name = "wget", specifier = "==3.2" },
 ]
 provides-extras = ["tensorrt"]
-
-[[package]]
-name = "cuda-toolkit"
-version = "12.8.1"
-source = { registry = "https://pypi.org/simple" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/d4/c8/7dce3a0b15b42a3b58e7d96eb22a687d3bf2c44e01d149a6874629cd9938/cuda_toolkit-12.8.1-py2.py3-none-any.whl", hash = "sha256:adc7906af4ecbf9a352f9dca5734eceb21daec281ccfcf5675e1d2f724fc2cba", size = 2283, upload-time = "2025-08-13T02:03:07.842Z" },
-]
-
-[package.optional-dependencies]
-cudart = [
-    { name = "nvidia-cuda-runtime-cu12", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
-]
 
 [[package]]
 name = "cycler"
@@ -3864,27 +3851,37 @@ wheels = [
 
 [[package]]
 name = "tensorrt-cu12"
-version = "10.14.1.48"
+version = "10.9.0.34"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "tensorrt-cu12-bindings" },
     { name = "tensorrt-cu12-libs" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/2d/b1/ce3941c368bc54d7e73cbc703ce1ceac2ad28bc8a9ee7614cfbf1626f1fa/tensorrt_cu12-10.14.1.48.tar.gz", hash = "sha256:1c6574f3532085a837c3d34d9ee8fae24e35f6d2324d851edfd95b41e185ab64", size = 18291, upload-time = "2025-11-04T21:06:00.892Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a7/2d/846e0365833811609322858b8ac659d6904234724258ceda2163741674a2/tensorrt_cu12-10.9.0.34.tar.gz", hash = "sha256:4b0472164c2e0f2956f3f9dd0b847d3c11ca3138bbb6f53d788da0f84a374182", size = 18226, upload-time = "2025-03-05T22:33:11.987Z" }
 
 [[package]]
 name = "tensorrt-cu12-bindings"
-version = "10.14.1.48"
+version = "10.9.0.34"
 source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5b/e3/8da7d16b3849ef213133cceca99637ded89f5d053ca28c3e3dac3e79390e/tensorrt_cu12_bindings-10.9.0.34-cp310-none-manylinux_2_28_x86_64.whl", hash = "sha256:7241fa4d0f9b87f20b5f8c490d9c36fdbb61313535555be46037cf7a0640a1b8", size = 1163408, upload-time = "2025-03-05T22:12:26.775Z" },
+    { url = "https://files.pythonhosted.org/packages/c2/70/e2eb9660bf5d3d6f288619ac24856186098327455b9f66713e0146f47fda/tensorrt_cu12_bindings-10.9.0.34-cp310-none-manylinux_2_31_aarch64.whl", hash = "sha256:2f1d763a4661e562aa102bf74540279d4f80cbc0464de6922779667b3451aaf9", size = 1226200, upload-time = "2025-03-05T22:26:27.495Z" },
+    { url = "https://files.pythonhosted.org/packages/e4/e0/b989f26ea518cb143d4d1289764d1db0fdef86ffda4fc91716d222f682b8/tensorrt_cu12_bindings-10.9.0.34-cp311-none-manylinux_2_28_x86_64.whl", hash = "sha256:50c78fd66dbb515b135d5f4fe28790f2eda119756950b51a6a45a77736a14b47", size = 1163901, upload-time = "2025-03-05T22:13:03.339Z" },
+    { url = "https://files.pythonhosted.org/packages/a3/6e/aedd86b0e7fe7bfbcffe4491226153f5386fdca8da69eab3fe80df1630e9/tensorrt_cu12_bindings-10.9.0.34-cp311-none-manylinux_2_31_aarch64.whl", hash = "sha256:523ffb08efb5d0939afabc9438715d679a4149ed25ca7728a1864dc6a6f1f8e0", size = 1226497, upload-time = "2025-03-05T22:26:00.336Z" },
+    { url = "https://files.pythonhosted.org/packages/26/1d/c1bdbd7e5c6ba9f78c9c08daf203368358dad850dd9e999f45f2ef406e5a/tensorrt_cu12_bindings-10.9.0.34-cp312-none-manylinux_2_28_x86_64.whl", hash = "sha256:5bc99385f84bdab148df3776e92705c420698b40de4d74159034095a876c8a2b", size = 1169446, upload-time = "2025-03-05T22:13:55.202Z" },
+    { url = "https://files.pythonhosted.org/packages/17/ae/335d20be70e6a13d9d85965b2b072f93c2ce416051d2df677ac61b67ff6c/tensorrt_cu12_bindings-10.9.0.34-cp312-none-manylinux_2_31_aarch64.whl", hash = "sha256:2455766e8d76b2f43338fc33e9dce92a847a1b86ce19cc6acc258ff71e834a93", size = 1211869, upload-time = "2025-03-05T22:25:30.702Z" },
+    { url = "https://files.pythonhosted.org/packages/6e/d5/def03b9b9202bfe72f6aa9a83051310512c1a9a20bdef05afa789e9a545f/tensorrt_cu12_bindings-10.9.0.34-cp313-none-manylinux_2_28_x86_64.whl", hash = "sha256:30c1518b16cfa84dd9d7e85e11e47d808dc18cafa6d2b93b26fb7bd1f297b84b", size = 1169542, upload-time = "2025-03-05T22:13:21.046Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/f4/7ddaf99f3d5b2a904cb7d19eba4f6b830e2a626ebd4434d76235f6029495/tensorrt_cu12_bindings-10.9.0.34-cp313-none-manylinux_2_31_aarch64.whl", hash = "sha256:539018b1c9e5e39c7e61ba1f9dc21c1e45d82875743ac0839e229e88c3c4c4dc", size = 1211949, upload-time = "2025-03-05T22:26:55.805Z" },
+]
 
 [[package]]
 name = "tensorrt-cu12-libs"
-version = "10.14.1.48"
+version = "10.9.0.34"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-toolkit", extra = ["cudart"] },
+    { name = "nvidia-cuda-runtime-cu12" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ff/6d/30739d868f61f2b70984d94aacc70af0d2ab9ee2ce6fcdbfd6dcae4c1531/tensorrt_cu12_libs-10.14.1.48.tar.gz", hash = "sha256:c36d9ed5e06f9b6e456448339ded40115ad3d144259766b86f232353e9d49fea", size = 716, upload-time = "2025-11-04T20:05:53.596Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ea/eb/932f9b007a3a77824dcd964e2f58b2272d957ac8b3923a6accf9a026f328/tensorrt_cu12_libs-10.9.0.34.tar.gz", hash = "sha256:9aa7ee34b9f1cebde126f48718eddd3602a38914f6050d60d2c12af8eb597043", size = 704, upload-time = "2025-03-05T22:21:24.921Z" }
 
 [[package]]
 name = "threadpoolctl"

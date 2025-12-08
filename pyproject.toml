@@ -57,14 +57,14 @@ dependencies = [
 
 [project.optional-dependencies]
 tensorrt = [
-    # TensorRT 10.14.1.48 - PyPI最新稳定版（2025年11月）
-    # ✅ 支持 CUDA 12.6/13.0 和 Blackwell 架构（RTX 50系列）
-    # ✅ 完整支持 Ada Lovelace（RTX 40系列）
-    # ✅ 包含最新性能优化和bug修复
-    # 注意：PyPI版本号与GitHub Release不同
-    "tensorrt-cu12==10.14.1.48; sys_platform == 'linux'",
-    "tensorrt-cu12-bindings==10.14.1.48; sys_platform == 'linux'",
-    "tensorrt-cu12-libs==10.14.1.48; sys_platform == 'linux'",
+    # TensorRT 10.9.0.34 - 最新 Linux 稳定版（2025年11月）
+    # ✅ 支持 CUDA 12.8/12.9 和 Blackwell 架构（RTX 50系列 sm_120）
+    # ✅ 完整支持 Ada Lovelace（RTX 40系列 sm_89）
+    # ✅ 根据 NVIDIA 官方文档，单一构建支持所有 CUDA 12.x 版本（https://docs.nvidia.com/deeplearning/tensorrt/latest/getting-started/support-matrix.html）
+    # ⚠️ 注意：10.14.1.48 仅支持 Windows，Linux 请使用 10.9.0.34
+    "tensorrt-cu12==10.9.0.34; sys_platform == 'linux'",
+    "tensorrt-cu12-bindings==10.9.0.34; sys_platform == 'linux'",
+    "tensorrt-cu12-libs==10.9.0.34; sys_platform == 'linux'",
 ]
 
 [project.urls]
