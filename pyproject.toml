@@ -3,7 +3,7 @@ name = "cosyvoice"
 version = "0.1.0"
 description = "CosyVoice: Multi-lingual large voice generation model, providing inference, training and deployment full-stack ability."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = "~=3.10.0"
 # 注意:tensorrt 包在某些系统上可能安装失败,可以注释掉相关行
 dependencies = [
     "conformer==0.3.2",
@@ -44,6 +44,8 @@ dependencies = [
     # ✅ 包含 FlexAttention、Compiled Autograd 等最新特性
     "torch==2.9.0",
     "torchaudio==2.9.0",
+    "nvidia-cublas-cu12",
+    "nvidia-cudnn-cu12",
     # torchcodec - torchaudio 2.9+ 的默认音频解码器
     "torchcodec==0.9.0",
     "transformers==4.51.3",

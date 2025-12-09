@@ -250,6 +250,20 @@
         let isFirstChunk = true;
         let pendingBytes = new Uint8Array(0); // 用于存储不完整的字节
         let availableSpeakers = [];
+        
+        // 调试信息：首包延迟相关
+        let requestStartTime = 0;
+        let firstChunkTime = 0;
+        let firstChunkSize = 0;
+
+        /**
+         * 带时间戳的日志输出
+         */
+        function log(message, type = 'info') {
+            const now = new Date();
+            const timeStr = now.toLocaleTimeString('zh-CN', { hour12: false }) + '.' + now.getMilliseconds().toString().padStart(3, '0');
+            console.log(`[${timeStr}] ${message}`);
+        }
 
         /**
          * 显示状态消息
@@ -301,7 +315,7 @@
                         speakerSelect.selectedIndex = 0;
                     }
                     
-                    console.log(`成功加载 ${data.speakers.length} 个说话人，默认: ${speakerSelect.value}`);
+                    log(`成功加载 ${data.speakers.length} 个说话人，默认: ${speakerSelect.value}`);
                 } else {
                     speakerSelect.innerHTML = '<option value="">无可用说话人</option>';
                 }
@@ -426,9 +440,16 @@
                 formData.append('text', text);
                 formData.append('speaker', speaker);
 
+                // 记录请求开始时间 (使用高精度时间)
+                requestStartTime = performance.now();
+                // log(`[CosyVoice] 请求开始时间: ${new Date().toISOString()}`);
+
                 // 发送请求
                 const response = await fetch('http://localhost:50000/tts', {
                     method: 'POST',
+                    headers: {
+                        'Connection': 'keep-alive'
+                    },
                     body: formData
                 });
 
@@ -450,6 +471,16 @@
                             await playAudioChunk(pendingBytes);
                         }
                         break;
+                    }
+
+                    // 首包到达时的计时
+                    if (isFirstChunk) {
+                        firstChunkTime = performance.now();
+                        firstChunkSize = value.length;
+                        const ttfb = (firstChunkTime - requestStartTime).toFixed(2);
+                        log(`⏱️ 首包延迟 (TTFB): ${ttfb}ms`);
+                        log(`📦 首包大小: ${firstChunkSize} 字节`);
+                        // log(`🚀 首包时间戳: ${new Date().toISOString()}`);
                     }
 
                     // 将接收到的数据块添加到数组（用于下载）
@@ -494,7 +525,24 @@
                 audioPlayer.src = audioUrl;
 
                 downloadBtn.disabled = false;
-                showStatus('播放完成！共接收 ' + chunkCount + ' 个音频块', 'success');
+                
+                // 计算并输出完整的性能数据
+                const totalTime = performance.now() - requestStartTime;
+                const ttfb = firstChunkTime - requestStartTime;
+                const streamingTime = totalTime - ttfb;
+                const totalSize = audioChunks.reduce((acc, chunk) => acc + chunk.length, 0);
+                const avgChunkSize = Math.floor(totalSize / chunkCount);
+                
+                log(`🎯 流式播放完成！`);
+                log(`⏱️ 首包延迟 (TTFB): ${ttfb.toFixed(2)}ms`);
+                log(`⏱️ 流式传输时间: ${streamingTime.toFixed(2)}ms`);
+                log(`⏱️ 总耗时: ${totalTime.toFixed(2)}ms`);
+                log(`📦 总音频大小: ${totalSize} 字节`);
+                log(`📊 接收块数: ${chunkCount} 块`);
+                log(`📊 平均块大小: ${avgChunkSize} 字节`);
+                log(`📊 平均吞吐量: ${(totalSize / (totalTime / 1000) / 1024).toFixed(2)} KB/s`);
+                
+                showStatus(`播放完成！TTFB: ${ttfb.toFixed(0)}ms`, 'success');
 
                 // 3秒后隐藏状态
                 setTimeout(hideStatus, 3000);

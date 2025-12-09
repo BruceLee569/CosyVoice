@@ -9,6 +9,12 @@ import glob
 
 import requests
 
+# 配置日志格式，确保显示毫秒级时间戳
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d %(levelname)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
 from fastapi import FastAPI, UploadFile, Form, File
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
@@ -42,9 +48,18 @@ static_dir = os.path.join(os.path.dirname(__file__), "static")
 if os.path.exists(static_dir):
     app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-def generate_data(model_output):
+def generate_data(model_output, request_start_time):
     """生成音频数据流，对输出进行削波处理防止爆音"""
+    is_first = True
+    chunk_count = 0
+    
     for i in model_output:
+        if is_first:
+            first_chunk_time = time.time()
+            ttfb = (first_chunk_time - request_start_time) * 1000
+            logging.info(f"[TTS统计] 首包生成完毕! 服务端TTFB: {ttfb:.2f}ms")
+            is_first = False
+
         tts_speech = i["tts_speech"].numpy()
         
         # 2. 输出端削波：防止 float -> int16 转换时的整数溢出
@@ -58,7 +73,11 @@ def generate_data(model_output):
         # 如果乘以 32768，当值为 1.0 时会得到 32768，导致 int16 溢出变成 -32768（爆音）
         # 因此应该乘以 32767
         tts_audio = (tts_speech * 32767).astype(np.int16).tobytes()
+        chunk_count += 1
         yield tts_audio
+    
+    total_time = (time.time() - request_start_time) * 1000
+    logging.info(f"[TTS统计] 流式传输结束. 总耗时: {total_time:.2f}ms, 共发送 {chunk_count} 个数据块")
 
 def load_speakers_from_directory(speaker_dir="asset/speakers"):
     """从目录加载所有说话人"""
@@ -132,6 +151,9 @@ async def get_speakers():
 @app.post("/tts")
 async def inference_zero_shot(text: str = Form(), speaker: str = Form(default="")):
     """文本转语音接口"""
+    request_start_time = time.time()
+    logging.info(f"[TTS请求] 收到请求: text='{text[:20]}...', speaker='{speaker}'")
+
     try:
         # 默认使用jok老师，如果没有则使用第一个说话人
         default_speaker = "jok老师" if "jok老师" in speakers_data else (list(speakers_data.keys())[0] if speakers_data else "")
@@ -140,13 +162,15 @@ async def inference_zero_shot(text: str = Form(), speaker: str = Form(default=""
         if not selected_speaker:
             return JSONResponse(content={"error": "没有可用的说话人"}, status_code=400)
         
+        logging.info(f"[TTS推理] 开始推理, 说话人: {selected_speaker}")
+
         # 使用指定的说话人ID进行推理
         model_output = cosyvoice.inference_zero_shot(
             text, "", None, 
             zero_shot_spk_id=selected_speaker,
             stream=True
         )
-        return StreamingResponse(generate_data(model_output))
+        return StreamingResponse(generate_data(model_output, request_start_time))
     except Exception as e:
         logging.error(f"TTS推理失败: {e}")
         return JSONResponse(content={"error": str(e)}, status_code=500)
@@ -179,7 +203,7 @@ if __name__ == "__main__":
         # 实测 4060 Ti 首包延迟 1.15，后续延迟 0.85，16G 显存占用 7.5G
         # 实测 4090 总体推理速度只比 3090 快个0.2秒，24G 显存占用 8G
         # cosyvoice = CosyVoice2(args.model_dir, load_jit=False, load_trt=False, fp16=True)
-        cosyvoice = CosyVoice2(args.model_dir, load_jit=False, load_trt=True, fp16=True)
+        cosyvoice = CosyVoice2(args.model_dir, load_jit=True, load_trt=True, fp16=True)
     except Exception as e:
         raise TypeError(f"导入{args.model_dir}失败，模型类型有误！错误: {e}")
 
