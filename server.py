@@ -178,7 +178,7 @@ async def inference_zero_shot(text: str = Form(), speaker: str = Form(default=""
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=50000)
+    parser.add_argument("--port", type=int, default=6008)
     parser.add_argument(
         "--model_dir",
         type=str,

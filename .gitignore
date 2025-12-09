@@ -59,3 +59,7 @@ requirements_temp.txt
 .requirements_temp.txt
 
 *.egg-info/
+
+offline_packages/
+offline_packages.zip
+pretrained_models.zip
