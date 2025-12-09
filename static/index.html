@@ -49,7 +49,8 @@
         }
 
         input[type="text"],
-        textarea {
+        textarea,
+        select {
             width: 100%;
             padding: 12px 16px;
             border: 2px solid #e0e0e0;
@@ -57,6 +58,7 @@
             font-size: 16px;
             transition: border-color 0.3s;
             font-family: inherit;
+            background: white;
         }
 
         textarea {
@@ -65,9 +67,14 @@
         }
 
         input[type="text"]:focus,
-        textarea:focus {
+        textarea:focus,
+        select:focus {
             outline: none;
             border-color: #667eea;
+        }
+
+        select {
+            cursor: pointer;
         }
 
         .button-group {
@@ -112,6 +119,13 @@
 
         .audio-section.show {
             display: block;
+        }
+
+        .audio-info {
+            text-align: center;
+            margin-bottom: 15px;
+            color: #666;
+            font-size: 14px;
         }
 
         .audio-controls {
@@ -197,8 +211,10 @@
         </div>
 
         <div class="input-group">
-            <label for="speakerInput">说话人（可选）：</label>
-            <input type="text" id="speakerInput" placeholder="默认说话人">
+            <label for="speakerSelect">选择说话人：</label>
+            <select id="speakerSelect">
+                <option value="">正在加载...</option>
+            </select>
         </div>
 
         <div class="button-group">
@@ -208,6 +224,9 @@
         <div class="status" id="status"></div>
 
         <div class="audio-section" id="audioSection">
+            <div class="audio-info">
+                🎵 音频正在实时流式播放...
+            </div>
             <div class="audio-controls">
                 <audio id="audioPlayer" controls></audio>
                 <button id="downloadBtn">📥 下载</button>
@@ -217,7 +236,7 @@
 
     <script>
         const textInput = document.getElementById('textInput');
-        const speakerInput = document.getElementById('speakerInput');
+        const speakerSelect = document.getElementById('speakerSelect');
         const generateBtn = document.getElementById('generateBtn');
         const audioSection = document.getElementById('audioSection');
         const audioPlayer = document.getElementById('audioPlayer');
@@ -225,9 +244,12 @@
         const status = document.getElementById('status');
 
         let audioChunks = [];
-        let mediaSource = null;
-        let sourceBuffer = null;
+        let audioContext = null;
+        let nextPlayTime = 0;
         let isStreamingComplete = false;
+        let isFirstChunk = true;
+        let pendingBytes = new Uint8Array(0); // 用于存储不完整的字节
+        let availableSpeakers = [];
 
         /**
          * 显示状态消息
@@ -245,31 +267,164 @@
         }
 
         /**
+         * 加载说话人列表
+         */
+        async function loadSpeakers() {
+            try {
+                const response = await fetch('http://localhost:50000/api/speakers');
+                const data = await response.json();
+                
+                if (data.speakers && data.speakers.length > 0) {
+                    availableSpeakers = data.speakers;
+                    speakerSelect.innerHTML = '';
+                    
+                    // 查找默认说话人"jok老师"
+                    const defaultSpeaker = 'jok老师';
+                    let hasDefault = false;
+                    
+                    data.speakers.forEach(speaker => {
+                        const option = document.createElement('option');
+                        option.value = speaker;
+                        option.textContent = speaker;
+                        
+                        // 设置默认选中
+                        if (speaker === defaultSpeaker) {
+                            option.selected = true;
+                            hasDefault = true;
+                        }
+                        
+                        speakerSelect.appendChild(option);
+                    });
+                    
+                    // 如果没有找到jok老师，将第一个说话人移到最前面并选中
+                    if (!hasDefault && data.speakers.length > 0) {
+                        speakerSelect.selectedIndex = 0;
+                    }
+                    
+                    console.log(`成功加载 ${data.speakers.length} 个说话人，默认: ${speakerSelect.value}`);
+                } else {
+                    speakerSelect.innerHTML = '<option value="">无可用说话人</option>';
+                }
+            } catch (error) {
+                console.error('加载说话人列表失败:', error);
+                speakerSelect.innerHTML = '<option value="">加载失败</option>';
+            }
+        }
+
+        /**
+         * 初始化 Web Audio API
+         */
+        function initAudioContext() {
+            if (!audioContext) {
+                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                nextPlayTime = 0;
+            }
+            return audioContext;
+        }
+
+        /**
+         * 合并字节数组
+         */
+        function mergeUint8Arrays(arr1, arr2) {
+            const merged = new Uint8Array(arr1.length + arr2.length);
+            merged.set(arr1, 0);
+            merged.set(arr2, arr1.length);
+            return merged;
+        }
+
+        /**
+         * 播放音频块
+         */
+        async function playAudioChunk(pcmData) {
+            if (!pcmData || pcmData.length === 0) {
+                return;
+            }
+
+            const ctx = initAudioContext();
+            
+            // 确保数据长度是2的倍数（Int16Array 需要）
+            let validLength = pcmData.length;
+            if (validLength % 2 !== 0) {
+                validLength -= 1;
+            }
+
+            if (validLength === 0) {
+                return;
+            }
+
+            // 创建对齐的数据视图
+            const alignedData = new Uint8Array(pcmData.buffer, pcmData.byteOffset, validLength);
+            
+            // 将 Int16 PCM 数据转换为 Float32
+            const int16Array = new Int16Array(alignedData.buffer, alignedData.byteOffset, validLength / 2);
+            const float32Array = new Float32Array(int16Array.length);
+            
+            for (let i = 0; i < int16Array.length; i++) {
+                float32Array[i] = int16Array[i] / 32768.0;
+            }
+
+            // 创建音频缓冲区
+            // CosyVoice2 默认采样率为 24000，CosyVoice1 为 22050
+            // 这里设置为 24000 以匹配 CosyVoice2-0.5B
+            const sampleRate = 24000;
+            const audioBuffer = ctx.createBuffer(1, float32Array.length, sampleRate);
+            audioBuffer.getChannelData(0).set(float32Array);
+
+            // 创建音频源
+            const source = ctx.createBufferSource();
+            source.buffer = audioBuffer;
+            source.connect(ctx.destination);
+
+            // 计算播放时间
+            const currentTime = ctx.currentTime;
+            if (nextPlayTime < currentTime) {
+                nextPlayTime = currentTime;
+            }
+
+            source.start(nextPlayTime);
+            nextPlayTime += audioBuffer.duration;
+        }
+
+        /**
          * 生成语音
          */
         async function generateSpeech() {
             const text = textInput.value.trim();
-            const speaker = speakerInput.value.trim();
+            const speaker = speakerSelect.value;
 
             if (!text) {
                 showStatus('请输入文本内容', 'error');
                 return;
             }
 
+            if (!speaker) {
+                showStatus('请选择说话人', 'error');
+                return;
+            }
+
             // 重置状态
             audioChunks = [];
+            pendingBytes = new Uint8Array(0);
             isStreamingComplete = false;
+            isFirstChunk = true;
             generateBtn.disabled = true;
             downloadBtn.disabled = true;
             audioSection.classList.remove('show');
             showStatus('正在生成语音...', 'loading');
-            status.innerHTML = '<span class="loading-spinner"></span>正在生成语音...';
+            status.innerHTML = '<span class="loading-spinner"></span>等待首包...';
+
+            // 初始化音频上下文
+            const ctx = initAudioContext();
+            if (ctx.state === 'suspended') {
+                await ctx.resume();
+            }
+            nextPlayTime = ctx.currentTime;
 
             try {
                 // 构建表单数据
                 const formData = new FormData();
                 formData.append('text', text);
-                formData.append('speaker', speaker || 'default');
+                formData.append('speaker', speaker);
 
                 // 发送请求
                 const response = await fetch('http://localhost:50000/tts', {
@@ -281,38 +436,65 @@
                     throw new Error('服务器响应错误');
                 }
 
-                // 读取流式响应
+                // 读取流式响应并立即播放
                 const reader = response.body.getReader();
+                let chunkCount = 0;
                 
                 while (true) {
                     const { done, value } = await reader.read();
                     
                     if (done) {
                         isStreamingComplete = true;
+                        // 播放剩余的字节
+                        if (pendingBytes.length > 0) {
+                            await playAudioChunk(pendingBytes);
+                        }
                         break;
                     }
 
-                    // 将接收到的数据块添加到数组
+                    // 将接收到的数据块添加到数组（用于下载）
                     audioChunks.push(value);
+                    chunkCount++;
+
+                    // 合并待处理的字节和新数据
+                    pendingBytes = mergeUint8Arrays(pendingBytes, value);
+
+                    // 确保有足够的字节进行播放（至少2字节，即一个Int16样本）
+                    if (pendingBytes.length >= 2) {
+                        // 计算可以播放的字节数（必须是2的倍数）
+                        const playableLength = Math.floor(pendingBytes.length / 2) * 2;
+                        
+                        if (playableLength > 0) {
+                            // 提取可播放的数据
+                            const playableData = pendingBytes.slice(0, playableLength);
+                            
+                            // 立即播放音频块
+                            await playAudioChunk(playableData);
+                            
+                            // 保留剩余的字节
+                            pendingBytes = pendingBytes.slice(playableLength);
+                        }
+                    }
+
+                    // 首包到达
+                    if (isFirstChunk) {
+                        isFirstChunk = false;
+                        showStatus('正在流式播放...', 'loading');
+                        status.innerHTML = '<span class="loading-spinner"></span>正在流式播放... (已接收 ' + chunkCount + ' 块)';
+                        audioSection.classList.add('show');
+                    } else {
+                        // 更新接收状态
+                        status.innerHTML = '<span class="loading-spinner"></span>正在流式播放... (已接收 ' + chunkCount + ' 块)';
+                    }
                 }
 
-                // 创建完整的音频 Blob
+                // 流式播放完成，准备下载音频
                 const audioBlob = createWavBlob(audioChunks);
                 const audioUrl = URL.createObjectURL(audioBlob);
-
-                // 设置音频播放器
                 audioPlayer.src = audioUrl;
-                audioPlayer.load();
-                
-                // 自动播放
-                audioPlayer.play().catch(e => {
-                    console.log('自动播放失败，可能需要用户交互', e);
-                });
 
-                // 显示音频区域
-                audioSection.classList.add('show');
                 downloadBtn.disabled = false;
-                showStatus('生成成功！', 'success');
+                showStatus('播放完成！共接收 ' + chunkCount + ' 个音频块', 'success');
 
                 // 3秒后隐藏状态
                 setTimeout(hideStatus, 3000);
@@ -387,6 +569,33 @@
         }
 
         /**
+         * 创建 WAV 格式的音频 Blob
+         */
+        function createWavBlob(chunks) {
+            // 合并所有音频数据块
+            const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+            const pcmData = new Uint8Array(totalLength);
+            let offset = 0;
+            
+            for (const chunk of chunks) {
+                pcmData.set(chunk, offset);
+                offset += chunk.length;
+            }
+
+            // 创建 WAV 文件头
+            const sampleRate = 24000; // 采样率 24000
+            const numChannels = 1; // 单声道
+            const bitsPerSample = 16; // 16位
+            
+            const wavHeader = createWavHeader(pcmData.length, sampleRate, numChannels, bitsPerSample);
+            
+            // 合并头部和数据
+            const wavData = new Uint8Array(wavHeader.length + pcmData.length);
+            wavData.set(wavHeader, 0);
+            wavData.set(pcmData, wavHeader.length);
+            
+            return new Blob([wavData], { type: 'audio/wav' });
+        }        /**
          * 写入字符串到 DataView
          */
         function writeString(view, offset, string) {
@@ -417,6 +626,11 @@
             showStatus('下载成功！', 'success');
             setTimeout(hideStatus, 2000);
         }
+
+        // 页面加载时初始化
+        window.addEventListener('DOMContentLoaded', () => {
+            loadSpeakers();
+        });
 
         // 事件监听
         generateBtn.addEventListener('click', generateSpeech);
