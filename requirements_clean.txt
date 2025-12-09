@@ -508,9 +508,7 @@ triton==3.5.0
     # via
     #   openai-whisper
     #   torch
-ttsfrd @ file:///${PROJECT_ROOT}/pretrained_models/CosyVoice-ttsfrd/ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl
     # via cosyvoice (pyproject.toml)
-ttsfrd-dependency @ file:///${PROJECT_ROOT}/pretrained_models/CosyVoice-ttsfrd/ttsfrd_dependency-0.1-py3-none-any.whl
     # via cosyvoice (pyproject.toml)
 typeguard==4.4.4
     # via inflect

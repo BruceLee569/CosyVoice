@@ -82,6 +82,8 @@ uv pip install --no-index --find-links ~/offline_packages \*.whl
 # 3) 再装源码包 (tar.gz/zip)，关闭 build isolation 避免联网
 uv pip install --no-index --no-build-isolation --no-deps \
     --find-links ~/offline_packages ~/offline_packages/*.tar.gz ~/offline_packages/*.zip
+
+uv pip install --no-index ./offline_packages/*.tar.gz ./offline_packages/*.zip
 ```
 
 ---
