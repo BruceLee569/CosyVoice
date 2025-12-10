@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "CosyVoice: Multi-lingual large voice generation model, providing inference, training and deployment full-stack ability."
 readme = "README.md"
 requires-python = "~=3.10.0"
-# 注意:tensorrt 包在某些系统上可能安装失败,可以注释掉相关行
+
 dependencies = [
     "conformer==0.3.2",
     "deepspeed==0.15.1; sys_platform == 'linux'",
@@ -24,26 +24,29 @@ dependencies = [
     "modelscope==1.20.0",
     "networkx==3.1",
     "omegaconf==2.3.0",
-    "onnx==1.16.0",
+    # tensorrt_llm 0.20.0 依赖约束
+    "onnx==1.18.0",
+    "cuda-python==12.9.4",
+    "protobuf==5.29.5",
     "onnxruntime-gpu==1.18.0; sys_platform == 'linux'",
     "onnxruntime==1.18.0; sys_platform == 'darwin' or sys_platform == 'win32'",
     # openai-whisper 最新版本 - 支持 triton 3.x 和 PyTorch 2.9
     "openai-whisper==20250625",
-    "protobuf==4.25",
+
     "pyarrow==18.1.0",
     "pydantic==2.7.0",
     "pyworld==0.3.4",
     "rich==13.7.1",
     "soundfile==0.12.1",
     "tensorboard==2.14.0",
-    # PyTorch 2.9.0 + CUDA 12.8 - RTX 50 系列必需！
+    # PyTorch 2.7.0 + CUDA 12.8 - tensorrt_llm 0.20.0 兼容版本
     # ✅ 支持 sm_120 (NVIDIA Blackwell 架构 - RTX 50系列)
     # ✅ 支持 sm_50-sm_90 (从 Maxwell 到 Ada Lovelace)
     # ✅ CUDA 12.8 包含 RTX 50 系列的内核支持
+    # ✅ tensorrt_llm 0.20.0 严格要求 torch==2.7.0
     # ⚠️ 重要：RTX 5070 Ti 需要 cu128 或 cu130，cu126 不支持！
-    # ✅ 包含 FlexAttention、Compiled Autograd 等最新特性
-    "torch==2.9.0",
-    "torchaudio==2.9.0",
+    "torch==2.7.0",
+    "torchaudio==2.7.0",
     "nvidia-cublas-cu12",
     "nvidia-cudnn-cu12",
     # torchcodec - torchaudio 2.9+ 的默认音频解码器
@@ -52,21 +55,24 @@ dependencies = [
     "uvicorn==0.30.0",
     "wetext==0.0.4",
     "wget==3.2",
+    
+    # TensorRT 10.10.0.31 - tensorrt_llm 0.20.0 兼容版本（实测可用）
+    # ✅ 支持 CUDA 12.8/12.9 和 Blackwell 架构（RTX 50系列 sm_120）
+    # ✅ 完整支持 Ada Lovelace（RTX 40系列 sm_89）
+    # ✅ 实测编译成功，TTS 音频效果良好
+    # ⚠️ 编译过程有 Slice 操作警告，但不影响最终使用
+    "tensorrt-cu12==10.10.0.31; sys_platform == 'linux'",
+    "tensorrt-cu12-bindings==10.10.0.31; sys_platform == 'linux'",
+    "tensorrt-cu12-libs==10.10.0.31; sys_platform == 'linux'",
+    
+    # tensorrt_llm 0.20.0 - TensorRT-LLM 推理引擎
+    # ✅ 严格要求 torch==2.7.0, onnx==1.18.0, protobuf==5.29.5
+    # ✅ 用于 Flow decoder estimator 的 TensorRT 加速
+    "tensorrt-llm==0.20.0; sys_platform == 'linux'",
+
     # 更好的文本规范化包 - 本地 wheel 包
     "ttsfrd-dependency @ file:///${PROJECT_ROOT}/pretrained_models/CosyVoice-ttsfrd/ttsfrd_dependency-0.1-py3-none-any.whl",
     "ttsfrd @ file:///${PROJECT_ROOT}/pretrained_models/CosyVoice-ttsfrd/ttsfrd-0.4.2-cp310-cp310-linux_x86_64.whl ; sys_platform == 'linux' and python_version == '3.10'",
-]
-
-[project.optional-dependencies]
-tensorrt = [
-    # TensorRT 10.9.0.34 - 最新 Linux 稳定版（2025年11月）
-    # ✅ 支持 CUDA 12.8/12.9 和 Blackwell 架构（RTX 50系列 sm_120）
-    # ✅ 完整支持 Ada Lovelace（RTX 40系列 sm_89）
-    # ✅ 根据 NVIDIA 官方文档，单一构建支持所有 CUDA 12.x 版本（https://docs.nvidia.com/deeplearning/tensorrt/latest/getting-started/support-matrix.html）
-    # ⚠️ 注意：10.14.1.48 仅支持 Windows，Linux 请使用 10.9.0.34
-    "tensorrt-cu12==10.9.0.34; sys_platform == 'linux'",
-    "tensorrt-cu12-bindings==10.9.0.34; sys_platform == 'linux'",
-    "tensorrt-cu12-libs==10.9.0.34; sys_platform == 'linux'",
 ]
 
 [project.urls]
@@ -90,21 +96,39 @@ cosyvoice = ["**/*"]
 # dev-dependencies = []
 
 [[tool.uv.index]]
+name = "tuna"
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/"
+default = true  # 设为默认，numpy, fastapi 等走国内源
+
+[[tool.uv.index]]
 name = "pytorch"
-# CUDA 12.8: RTX 50 系列 (sm_120) 必需！
 # ⚠️ 关键：只有 cu128/cu130 支持 Blackwell 架构
-# - 支持 sm_120 (RTX 5090/5080/5070 Ti/5070)
-# - 支持 sm_50-sm_90 (所有旧架构)
 # - cu126 不支持 RTX 50，会报 "no kernel image" 错误
 url = "https://download.pytorch.org/whl/cu128"
-explicit = true
+explicit = true # 显式源：除非指定，否则不查这里
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true # 显式源：除非指定，否则不查这里
 
 [[tool.uv.index]]
 name = "onnxruntime"
 url = "https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/onnxruntime-cuda-12/pypi/simple/"
-explicit = true
+explicit = true # 显式源：除非指定，否则不查这里
 
 [tool.uv.sources]
-# 强制这些包从 PyTorch 源下载
+# PyTorch 全家桶 -> 强制走 pytorch 源
 torch = { index = "pytorch" }
 torchaudio = { index = "pytorch" }
+torchcodec = { index = "pytorch" }
+
+# NVIDIA 全家桶 -> 强制走 nvidia 源
+# 必须把每一个涉及到的包都写上，避免 uv 去默认源找源码包
+tensorrt = { index = "nvidia" }
+tensorrt-cu12 = { index = "nvidia" }
+tensorrt-cu12-bindings = { index = "nvidia" }
+# tensorrt-cu12-libs 使用本地文件，不需要指定 index
+tensorrt-llm = { index = "nvidia" }
+nvidia-cublas-cu12 = { index = "nvidia" }
+nvidia-cudnn-cu12 = { index = "nvidia" }

@@ -35,7 +35,7 @@ $$ \text{TTFF} = T_{\text{Frontend}} + T_{\text{LLM\_Prefill}} + T_{\text{LLM\_D
     *   **干了什么**: LLM “阅读”所有的提示词和历史对话。这叫“预填充 (Prefill)”。
     *   **现状**: 速度取决于提示词长短。目前 PyTorch 还能应付。
 
-3.  **$T_{\text{LLM\_Decode}}$ (大脑思考, ~100ms -> 20ms)** <font color="red">**[关键瓶颈 I]**</font>
+3.  **$T_{\text{LLM\_Decode}}$ (大脑思考, ~150ms -> 30ms)** <font color="red">**[关键瓶颈 I]**</font>
     *   **干了什么**: LLM 开始一个字一个字地“蹦”出语音指令（Semantic Tokens）。
     *   **问题**: 就像人说话不能结巴一样，为了流式播放，LLM 必须极快地吐出第一批 Token（例如前 7 个）。
     *   **为何 PyTorch 慢**: 它每次吐一个字都要重新搬运一次巨大的模型权重，效率极低。
@@ -43,7 +43,7 @@ $$ \text{TTFF} = T_{\text{Frontend}} + T_{\text{LLM\_Prefill}} + T_{\text{LLM\_D
 
 4.  **$T_{\text{Flow}}$ (声学映射, ~150ms -> 30ms)** <font color="red">**[关键瓶颈 II]**</font>
     *   **干了什么**: 把 LLM 给的抽象指令，转化成声音的“骨架”（梅尔频谱）。这是一个复杂的扩散过程 (Flow Matching)，需要反复迭代好几步（比如 10 步）。
-    *   **现状**: 官方 `server.py` 里的 `load_trt=True` 已经帮您解决了这个问题！它自动生成的 `.plan` 文件就是这个环节的加速器。
+    *   **现状**: 官方 `server.py` 里的 `load_trt=True` 已经帮您解决了这个问题！它调用 `tensorrt` 库自动生成的 `.plan` 文件就是这个环节的加速器。
 
 5.  **$T_{\text{Vocoder}}$ (声码器, ~10ms)**
     *   **干了什么**: 给“骨架”填上血肉，生成最终的波形文件。
@@ -64,19 +64,24 @@ $$ \text{TTFF} = T_{\text{Frontend}} + T_{\text{LLM\_Prefill}} + T_{\text{LLM\_D
 
 ### 2.1 准备环境
 由于系统自带环境可能冲突，我们新建一个干净的 VIP 房间来做这件事。
-
+相关依赖版本基于此镜像：[nvcr.io/nvidia/tritonserver:25.06-trtllm-python-py3](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/introduction/compatibility.html)
 ```bash
 # 1. 创建新环境 (约 2 分钟)
-conda create --prefix /root/autodl-tmp/conda_envs/cosy_engine python=3.10 -y
-conda activate /root/autodl-tmp/conda_envs/cosy_engine
+uv venv .venv-trtllm --python 3.12.3
+source ~/.venv-trtllm/bin/activate
 
 # 2. 安装加速引擎工具包 (TensorRT-LLM) (约 5 分钟)
-pip install tensorrt_llm==0.10.0 --extra-index-url https://pypi.nvidia.com
-pip install torch==2.3.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
-pip install modelscope "numpy<2.0.0"
+#    这里会同时安装 tensorrt_llm 以及其所需的 torch / transformers 等依赖
+uv pip install tensorrt==10.10.0.31 tensorrt_llm==0.20.0
 
-# 3. 下载模型文件 (如果已有则跳过)
-cd ~/workspace/CosyVoice/runtime/triton_trtllm
+# 3. 安装兼容版本的依赖（重要！）
+#    tensorrt_llm 0.20.0 需要特定版本的 onnx 和 protobuf
+uv pip install 'onnx>=1.17.0,<1.19.0' 'protobuf>=3.20.2,<6'
+uv pip install 'cuda-python>=12.0.0,<13.0.0'
+
+# 4. 下载模型文件 (如果已有则跳过)
+cd ~/ai/CosyVoice/runtime/triton_trtllm
+uv pip install modelscope
 modelscope download --model yuekai/cosyvoice2_llm --local_dir ./cosyvoice2_llm
 ```
 

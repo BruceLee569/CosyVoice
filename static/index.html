@@ -567,9 +567,11 @@
                 const response = await fetch('/tts', {
                     method: 'POST',
                     headers: {
-                        'Connection': 'keep-alive'
+                        'Connection': 'keep-alive',
+                        'Keep-Alive': 'timeout=60, max=1000'  // 明确keep-alive参数
                     },
-                    body: formData
+                    body: formData,
+                    keepalive: true  // 启用浏览器级别的keepalive
                 });
 
                 if (!response.ok) {
