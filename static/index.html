@@ -62,8 +62,9 @@
         }
 
         textarea {
-            min-height: 100px;
+            min-height: 180px;
             resize: vertical;
+            line-height: 1.6;
         }
 
         input[type="text"]:focus,
@@ -71,6 +72,71 @@
         select:focus {
             outline: none;
             border-color: #667eea;
+        }
+
+        /* 自动播放开关样式 */
+        .switch-group {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 20px;
+            padding: 12px 16px;
+            background: #f8f9fa;
+            border-radius: 10px;
+        }
+
+        .switch-group label {
+            margin: 0;
+            font-weight: 600;
+            color: #555;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .switch {
+            position: relative;
+            display: inline-block;
+            width: 50px;
+            height: 26px;
+        }
+
+        .switch input {
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+
+        .slider {
+            position: absolute;
+            cursor: pointer;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background-color: #ccc;
+            transition: .3s;
+            border-radius: 26px;
+        }
+
+        .slider:before {
+            position: absolute;
+            content: "";
+            height: 20px;
+            width: 20px;
+            left: 3px;
+            bottom: 3px;
+            background-color: white;
+            transition: .3s;
+            border-radius: 50%;
+        }
+
+        input:checked + .slider {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        }
+
+        input:checked + .slider:before {
+            transform: translateX(24px);
         }
 
         select {
@@ -130,19 +196,34 @@
 
         .audio-controls {
             display: flex;
-            align-items: center;
+            flex-direction: column;
             gap: 15px;
         }
 
+        .audio-player-wrapper {
+            width: 100%;
+        }
+
         audio {
-            flex: 1;
+            width: 100%;
             height: 40px;
         }
 
+        /* 隐藏原生音频控件的下载按钮 */
+        audio::-webkit-media-controls-enclosure {
+            max-width: 100%;
+        }
+
+        .download-actions {
+            display: flex;
+            gap: 10px;
+        }
+
         #downloadBtn {
+            flex: 1;
             background: #28a745;
             color: white;
-            padding: 10px 20px;
+            padding: 12px 20px;
             min-width: 120px;
         }
 
@@ -155,6 +236,19 @@
         #downloadBtn:disabled {
             background: #ccc;
             cursor: not-allowed;
+        }
+
+        #clearBtn {
+            background: #6c757d;
+            color: white;
+            padding: 12px 20px;
+            min-width: 100px;
+        }
+
+        #clearBtn:hover {
+            background: #5a6268;
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(108, 117, 125, 0.4);
         }
 
         .status {
@@ -217,6 +311,17 @@
             </select>
         </div>
 
+        <div class="switch-group">
+            <label for="autoPlaySwitch">
+                🔊 自动播放
+                <span style="font-size: 12px; color: #999; font-weight: normal;">(关闭后仅在后台接收音频数据)</span>
+            </label>
+            <label class="switch">
+                <input type="checkbox" id="autoPlaySwitch" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+
         <div class="button-group">
             <button id="generateBtn">🎵 生成语音</button>
         </div>
@@ -224,12 +329,17 @@
         <div class="status" id="status"></div>
 
         <div class="audio-section" id="audioSection">
-            <div class="audio-info">
-                🎵 音频正在实时流式播放...
+            <div class="audio-info" id="audioInfo">
+                🎵 音频生成中...
             </div>
             <div class="audio-controls">
-                <audio id="audioPlayer" controls></audio>
-                <button id="downloadBtn">📥 下载</button>
+                <div class="audio-player-wrapper">
+                    <audio id="audioPlayer" controls controlsList="nodownload"></audio>
+                </div>
+                <div class="download-actions">
+                    <button id="downloadBtn">📥 下载音频</button>
+                    <button id="clearBtn">🗑️ 清除</button>
+                </div>
             </div>
         </div>
     </div>
@@ -241,6 +351,9 @@
         const audioSection = document.getElementById('audioSection');
         const audioPlayer = document.getElementById('audioPlayer');
         const downloadBtn = document.getElementById('downloadBtn');
+        const clearBtn = document.getElementById('clearBtn');
+        const autoPlaySwitch = document.getElementById('autoPlaySwitch');
+        const audioInfo = document.getElementById('audioInfo');
         const status = document.getElementById('status');
 
         let audioChunks = [];
@@ -285,7 +398,7 @@
          */
         async function loadSpeakers() {
             try {
-                const response = await fetch('http://localhost:50000/api/speakers');
+                const response = await fetch('/api/speakers');
                 const data = await response.json();
                 
                 if (data.speakers && data.speakers.length > 0) {
@@ -317,11 +430,13 @@
                     
                     log(`成功加载 ${data.speakers.length} 个说话人，默认: ${speakerSelect.value}`);
                 } else {
-                    speakerSelect.innerHTML = '<option value="">无可用说话人</option>';
+                    speakerSelect.innerHTML = '<option value="">使用默认说话人</option>';
+                    log('未加载到说话人列表，将使用服务端默认说话人');
                 }
             } catch (error) {
                 console.error('加载说话人列表失败:', error);
-                speakerSelect.innerHTML = '<option value="">加载失败</option>';
+                speakerSelect.innerHTML = '<option value="">使用默认说话人</option>';
+                log('加载说话人列表失败，将使用服务端默认说话人');
             }
         }
 
@@ -350,6 +465,11 @@
          * 播放音频块
          */
         async function playAudioChunk(pcmData) {
+            // 检查是否启用自动播放
+            if (!autoPlaySwitch.checked) {
+                return;
+            }
+
             if (!pcmData || pcmData.length === 0) {
                 return;
             }
@@ -411,10 +531,7 @@
                 return;
             }
 
-            if (!speaker) {
-                showStatus('请选择说话人', 'error');
-                return;
-            }
+            // 允许 speaker 为空，服务端会使用默认说话人
 
             // 重置状态
             audioChunks = [];
@@ -427,12 +544,14 @@
             showStatus('正在生成语音...', 'loading');
             status.innerHTML = '<span class="loading-spinner"></span>等待首包...';
 
-            // 初始化音频上下文
-            const ctx = initAudioContext();
-            if (ctx.state === 'suspended') {
-                await ctx.resume();
+            // 初始化音频上下文（仅当启用自动播放时）
+            if (autoPlaySwitch.checked) {
+                const ctx = initAudioContext();
+                if (ctx.state === 'suspended') {
+                    await ctx.resume();
+                }
+                nextPlayTime = ctx.currentTime;
             }
-            nextPlayTime = ctx.currentTime;
 
             try {
                 // 构建表单数据
@@ -445,7 +564,7 @@
                 // log(`[CosyVoice] 请求开始时间: ${new Date().toISOString()}`);
 
                 // 发送请求
-                const response = await fetch('http://localhost:50000/tts', {
+                const response = await fetch('/tts', {
                     method: 'POST',
                     headers: {
                         'Connection': 'keep-alive'
@@ -510,12 +629,15 @@
                     // 首包到达
                     if (isFirstChunk) {
                         isFirstChunk = false;
-                        showStatus('正在流式播放...', 'loading');
-                        status.innerHTML = '<span class="loading-spinner"></span>正在流式播放... (已接收 ' + chunkCount + ' 块)';
+                        const playModeText = autoPlaySwitch.checked ? '流式播放' : '接收数据';
+                        audioInfo.textContent = autoPlaySwitch.checked ? '🎵 音频正在实时流式播放...' : '📥 音频数据接收中（后台模式）...';
+                        showStatus(`正在${playModeText}...`, 'loading');
+                        status.innerHTML = `<span class="loading-spinner"></span>正在${playModeText}... (已接收 ${chunkCount} 块)`;
                         audioSection.classList.add('show');
                     } else {
                         // 更新接收状态
-                        status.innerHTML = '<span class="loading-spinner"></span>正在流式播放... (已接收 ' + chunkCount + ' 块)';
+                        const playModeText = autoPlaySwitch.checked ? '流式播放' : '接收数据';
+                        status.innerHTML = `<span class="loading-spinner"></span>正在${playModeText}... (已接收 ${chunkCount} 块)`;
                     }
                 }
 
@@ -533,7 +655,8 @@
                 const totalSize = audioChunks.reduce((acc, chunk) => acc + chunk.length, 0);
                 const avgChunkSize = Math.floor(totalSize / chunkCount);
                 
-                log(`🎯 流式播放完成！`);
+                const completionText = autoPlaySwitch.checked ? '流式播放完成' : '音频接收完成';
+                log(`🎯 ${completionText}！`);
                 log(`⏱️ 首包延迟 (TTFB): ${ttfb.toFixed(2)}ms`);
                 log(`⏱️ 流式传输时间: ${streamingTime.toFixed(2)}ms`);
                 log(`⏱️ 总耗时: ${totalTime.toFixed(2)}ms`);
@@ -542,7 +665,10 @@
                 log(`📊 平均块大小: ${avgChunkSize} 字节`);
                 log(`📊 平均吞吐量: ${(totalSize / (totalTime / 1000) / 1024).toFixed(2)} KB/s`);
                 
-                showStatus(`播放完成！TTFB: ${ttfb.toFixed(0)}ms`, 'success');
+                audioInfo.textContent = autoPlaySwitch.checked ? 
+                    '✅ 流式播放完成，可以重新播放或下载' : 
+                    '✅ 音频接收完成，点击播放器试听或下载';
+                showStatus(`${completionText}！TTFB: ${ttfb.toFixed(0)}ms`, 'success');
 
                 // 3秒后隐藏状态
                 setTimeout(hideStatus, 3000);
@@ -675,6 +801,26 @@
             setTimeout(hideStatus, 2000);
         }
 
+        /**
+         * 清除音频
+         */
+        function clearAudio() {
+            audioChunks = [];
+            audioPlayer.src = '';
+            audioSection.classList.remove('show');
+            downloadBtn.disabled = true;
+            hideStatus();
+            
+            // 停止音频上下文
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+            nextPlayTime = 0;
+            
+            log('🗑️ 已清除音频数据');
+        }
+
         // 页面加载时初始化
         window.addEventListener('DOMContentLoaded', () => {
             loadSpeakers();
@@ -683,6 +829,7 @@
         // 事件监听
         generateBtn.addEventListener('click', generateSpeech);
         downloadBtn.addEventListener('click', downloadAudio);
+        clearBtn.addEventListener('click', clearAudio);
         
         // 回车键触发生成
         textInput.addEventListener('keypress', (e) => {
