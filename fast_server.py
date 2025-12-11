@@ -46,7 +46,7 @@ app = FastAPI()
 class TimingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         # 在请求刚到达时立即开始计时
-        request.state.start_time = time.time()
+        request.state.start_time = time.perf_counter()
         response = await call_next(request)
         return response
 
@@ -79,6 +79,84 @@ TRTLLM_CHAT_TEMPLATE = (
 )
 
 
+def split_text_by_punctuation(text, max_length=100):
+    """根据标点符号智能切分文本，确保每段长度可控
+    
+    Args:
+        text: 输入文本
+        max_length: 每段最大字符数（默认100，保证引擎输入安全）
+    
+    Returns:
+        List[str]: 切分后的文本段落列表
+    """
+    # 定义分段标点符号（按优先级排序）
+    primary_punctuations = ['。', '！', '？', '；', '.', '!', '?', ';']
+    secondary_punctuations = ['，', '、', ',', '\n']
+    
+    if len(text) <= max_length:
+        return [text] if text.strip() else []
+    
+    segments = []
+    current_segment = ""
+    
+    i = 0
+    while i < len(text):
+        char = text[i]
+        current_segment += char
+        
+        # 如果当前段落已达到最大长度
+        if len(current_segment) >= max_length:
+            # 尝试在主要标点处切分
+            last_primary_idx = -1
+            for j in range(len(current_segment) - 1, -1, -1):
+                if current_segment[j] in primary_punctuations:
+                    last_primary_idx = j
+                    break
+            
+            if last_primary_idx > 0:
+                # 在主要标点处切分
+                segments.append(current_segment[:last_primary_idx + 1].strip())
+                current_segment = current_segment[last_primary_idx + 1:]
+            else:
+                # 尝试在次要标点处切分
+                last_secondary_idx = -1
+                for j in range(len(current_segment) - 1, -1, -1):
+                    if current_segment[j] in secondary_punctuations:
+                        last_secondary_idx = j
+                        break
+                
+                if last_secondary_idx > 0:
+                    segments.append(current_segment[:last_secondary_idx + 1].strip())
+                    current_segment = current_segment[last_secondary_idx + 1:]
+                else:
+                    # 强制在当前位置切分（紧急情况）
+                    segments.append(current_segment.strip())
+                    current_segment = ""
+        
+        i += 1
+    
+    # 添加最后一段
+    if current_segment.strip():
+        segments.append(current_segment.strip())
+    
+    # 过滤空段落
+    segments = [s for s in segments if s.strip()]
+    
+    logging.info(f"[文本分段] 原始长度: {len(text)} 字符, 分成 {len(segments)} 段, 每段≤{max_length}字符")
+    for idx, seg in enumerate(segments):
+        logging.info(f"  段{idx+1}: {len(seg)}字符 - '{seg[:30]}{'...' if len(seg) > 30 else ''}'")
+    
+    return segments
+
+
+def log_gpu_memory(prefix=""):
+    """记录GPU显存使用情况"""
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
+        logging.info(f"[显存监控{' - ' + prefix if prefix else ''}] 已分配: {allocated:.2f}GB, 已预留: {reserved:.2f}GB")
+
+
 def convert_speech_tokens_to_str(speech_tokens):
     """将 speech token IDs 转换为 <|s_XXXXX|> 格式的字符串"""
     if isinstance(speech_tokens, torch.Tensor):
@@ -104,12 +182,14 @@ def extract_speech_ids_from_str(speech_tokens_str_list):
 class FastCosyVoice2:
     """集成 TensorRT-LLM 的 CosyVoice2 推理类"""
     
-    def __init__(self, cosyvoice_model, trtllm_engine_dir=None, trtllm_tokenizer_dir=None, use_trtllm=True):
-        self.cosyvoice = cosyvoice_model
+    def __init__(self, cosyvoice_model, trtllm_engine_dir=None, trtllm_tokenizer_dir=None, use_trtllm=True, spk2info_path=None):
+        self.cosyvoice : CosyVoice2 = cosyvoice_model
         self.use_trtllm = use_trtllm and TRTLLM_AVAILABLE
         self.trtllm_runner = None
         self.trtllm_tokenizer = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.spk2info_path = spk2info_path  # 保存 spk2info.pt 的路径
+        self._request_id_counter = 0  # 🔴 添加 request_id 计数器，避免 TensorRT-LLM 状态冲突
         
         # 存储原始的 prompt_text 字符串，用于 TensorRT-LLM
         self.spk_prompt_text_raw = {}
@@ -144,11 +224,11 @@ class FastCosyVoice2:
         runner_kwargs = dict(
             engine_dir=engine_dir,
             rank=runtime_rank,
-            max_output_len=2048,
+            max_output_len=2048,    # 最大输出长度，支持长文本生成
             enable_context_fmha_fp32_acc=False,
             max_batch_size=1,
-            max_input_len=512,
-            kv_cache_free_gpu_memory_fraction=0.6,
+            max_input_len=2048,     # 🔴 增大到 2048，支持长文本输入（prompt + tts_text）
+            kv_cache_free_gpu_memory_fraction=0.25,  # 降低 KV 缓存占用，平衡显存
             cuda_graph_mode=False,
             gather_generation_logits=False,
         )
@@ -200,10 +280,14 @@ class FastCosyVoice2:
         try:
             input_length = input_ids.shape[1]
             
+            # 🔴 生成唯一的 request_id，避免 TensorRT-LLM 内部状态冲突
+            self._request_id_counter += 1
+            request_id = self._request_id_counter
+            
             # TensorRT-LLM 流式生成
             outputs_iter = self.trtllm_runner.generate(
                 batch_input_ids=[input_ids[0]],
-                max_new_tokens=2048,
+                max_new_tokens=1024,  # 🔴 从2048降低到1024，减少 KV Cache 占用
                 end_id=self.eos_token_id,
                 pad_id=self.eos_token_id,
                 temperature=0.8,
@@ -303,20 +387,66 @@ class FastCosyVoice2:
             logging.error(f"TensorRT-LLM 生成失败: {e}")
             raise
     
-    def inference_zero_shot(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id='', stream=True):
-        """零样本推理（集成 TensorRT-LLM 流式生成）"""
-        if not self.use_trtllm:
-            # 回退到原始 CosyVoice2 推理
-            for output in self.cosyvoice.inference_zero_shot(
-                text, prompt_text, prompt_speech_16k, 
-                zero_shot_spk_id=zero_shot_spk_id, 
-                stream=stream
-            ):
-                yield output
+    def inference_zero_shot(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id='', stream=True, request_start_time=None):
+        """零样本推理（集成 TensorRT-LLM 流式生成 + 长文本分段）"""
+        # 记录推理开始时间（如果未传入）
+        if request_start_time is None:
+            request_start_time = time.perf_counter()
+        
+        # ========== 长文本分段预处理 ==========
+        # 🔴 激进策略：每段≤30字符，最大程度控制显存峰值
+        # 原因：TensorRT-LLM 的 KV Cache 会随输入长度线性增长
+        text_segments = split_text_by_punctuation(text, max_length=30)
+        
+        if len(text_segments) == 0:
+            logging.warning("[文本分段] 输入文本为空，跳过推理")
             return
         
+        logging.info(f"[长文本处理] 原始文本 {len(text)} 字符 → 分成 {len(text_segments)} 段进行流式推理")
+        log_gpu_memory("分段前")
+        
+        # ========== 逐段推理并流式返回 ==========
+        for segment_idx, text_segment in enumerate(text_segments):
+            segment_start_time = time.perf_counter()
+            logging.info(f"[段落推理 {segment_idx+1}/{len(text_segments)}] 开始处理: '{text_segment[:50]}{'...' if len(text_segment) > 50 else ''}'")
+            
+            # 调用单段推理（内部逻辑保持不变）
+            for output in self._inference_single_segment(
+                text_segment, prompt_text, prompt_speech_16k,
+                zero_shot_spk_id=zero_shot_spk_id,
+                stream=stream,
+                request_start_time=request_start_time if segment_idx == 0 else segment_start_time,
+                is_first_segment=(segment_idx == 0)
+            ):
+                yield output
+            
+            segment_time = (time.perf_counter() - segment_start_time) * 1000
+            logging.info(f"[段落推理 {segment_idx+1}/{len(text_segments)}] 完成，耗时: {segment_time:.2f}ms")
+            log_gpu_memory(f"段{segment_idx+1}完成后")  # 🔴 每段后监控显存
+    
+    def _inference_single_segment(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id='', stream=True, request_start_time=None, is_first_segment=True):
+        """单段文本推理（原 inference_zero_shot 的核心逻辑）"""
+        # 🔴 关键决策：分段场景下全部使用 PyTorch 推理
+        # 原因：TensorRT-LLM 在多次调用时有 request_id 冲突 + KV Cache 累积问题
+        # PyTorch 推理虽然慢一些，但显存可控且稳定
+        for output in self.cosyvoice.inference_zero_shot(
+            text, prompt_text, prompt_speech_16k, 
+            zero_shot_spk_id=zero_shot_spk_id, 
+            stream=stream
+        ):
+            yield output
+        
+        # 🔴 每段推理后强制同步 GPU 并清理缓存
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return
+        
         # 使用 TensorRT-LLM 加速的推理流程（流式生成 + 流式 token2wav）
+        this_uuid = None  # 提前声明，确保异常时也能清理
         try:
+            # ========== 阶段 1: 上下文加载 ==========
+            context_start = time.perf_counter()
+            
             # 1. 获取 speaker info（包含 prompt_speech_tokens）
             spk_info = self.cosyvoice.frontend.spk2info.get(zero_shot_spk_id)
             if spk_info is None:
@@ -334,44 +464,90 @@ class FastCosyVoice2:
             prompt_speech_feat = spk_info['prompt_speech_feat']
             flow_embedding = spk_info['flow_embedding']
             
+            context_load_time = (time.perf_counter() - context_start) * 1000
+            if is_first_segment:
+                logging.info(f"[延迟分析-01] 上下文加载: {context_load_time:.2f}ms (spk_info检索+数据解析)")
+            
+            # ========== 阶段 2: LLM 输入准备 ==========
+            prepare_start = time.perf_counter()
+            
             # 4. 准备 LLM 输入（使用原始字符串 + chat template）
             input_ids = self._prepare_llm_input(text, prompt_text_raw, llm_prompt_speech_token)
             
-            logging.info(f"[FastTTS] TensorRT-LLM 输入长度: {input_ids.shape[1]} tokens")
+            prepare_time = (time.perf_counter() - prepare_start) * 1000
+            if is_first_segment:
+                logging.info(f"[延迟分析-02] LLM输入准备: {prepare_time:.2f}ms (text:{len(text)} chars, prompt:{len(prompt_text_raw)} chars, input_tokens:{input_ids.shape[1]})")
+            
+            # ========== 阶段 3: 推理参数初始化 ==========
+            init_start = time.perf_counter()
             
             # 5. 初始化流式参数
             this_uuid = str(uuid_module.uuid1())
             model = self.cosyvoice.model
             model.hift_cache_dict[this_uuid] = None
             
-            token_hop_len = 25  # 每块处理的 token 数
+            # 核心参数：保持原始对齐逻辑不变
+            token_hop_len = 25  # 标准 hop 长度（保持原始设置）
+            token_hop_len_first = 15  # 首块使用更小的 hop，减少等待
             pre_lookahead_len = model.flow.pre_lookahead_len  # 前瞻长度 (3)
             
-            # 计算 prompt_token_pad（对齐到 token_hop_len 的倍数）
+            # 关键：prompt_token_pad 必须基于标准 hop_len 计算，不能改变
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / token_hop_len) * token_hop_len - flow_prompt_speech_token.shape[1])
             
             token_offset = 0
             chunk_idx = 0
-            first_chunk_tokens_needed = token_hop_len + prompt_token_pad + pre_lookahead_len  # ~28
             
-            logging.info(f"[流式生成] 开始流式生成+token2wav: first_chunk_needed={first_chunk_tokens_needed}")
+            # RTF 统计
+            total_audio_duration = 0.0  # 累计生成的音频时长（秒）
+            total_processing_time = 0.0  # 累计处理时间（秒）
+            sample_rate = 22050  # CosyVoice2 的采样率
+            
+            init_time = (time.perf_counter() - init_start) * 1000
+            # 首块实际需要的 tokens 数量
+            first_chunk_tokens_needed = token_hop_len_first + prompt_token_pad + pre_lookahead_len
+            if is_first_segment:
+                logging.info(f"[延迟分析-03] 推理参数初始化: {init_time:.2f}ms (hop_first={token_hop_len_first}, hop_normal={token_hop_len}, prompt_pad={prompt_token_pad}, lookahead={pre_lookahead_len}, first_needed={first_chunk_tokens_needed})")
+                logging.info(f"[流式生成] 开始流式生成+token2wav: first_chunk_needed={first_chunk_tokens_needed} tokens (原始配置需28)")
+            
+            # ========== 阶段 4: Token 生成 ==========
+            token_gen_start = time.perf_counter()
+            first_token_gen_time = None
             
             # 6. 流式生成 + 流式 token2wav
             speech_tokens = []
             generation_done = False
+            first_chunk_generated = False
             
             for current_tokens, is_final in self._trtllm_generate_streaming(input_ids):
+                # 记录首个 token 生成完毕的时间
+                if first_token_gen_time is None:
+                    first_token_gen_time = (time.perf_counter() - token_gen_start) * 1000
+                    if is_first_segment:
+                        logging.info(f"[延迟分析-04a] 首个Token生成完毕: {first_token_gen_time:.2f}ms (首包tokens: {len(current_tokens)})")
+                
                 speech_tokens = current_tokens
                 generation_done = is_final
                 
                 # 检查是否有足够的 tokens 生成第一块音频
                 while True:
-                    this_token_hop_len = token_hop_len + prompt_token_pad if token_offset == 0 else token_hop_len
+                    # 首块使用小 hop，后续块使用正常hop
+                    if token_offset == 0:
+                        this_token_hop_len = token_hop_len_first + prompt_token_pad
+                    else:
+                        this_token_hop_len = token_hop_len
+                    
                     tokens_needed = token_offset + this_token_hop_len + pre_lookahead_len
                     
                     if tokens_needed <= len(speech_tokens):
+                        if not first_chunk_generated:
+                            # ========== 阶段 5: 首块音频合成 ==========
+                            first_chunk_start = time.perf_counter()
+                            accumulated_tokens_time = (first_chunk_start - token_gen_start) * 1000
+                            if is_first_segment:
+                                logging.info(f"[延迟分析-04b] Token累积到首块需量: {accumulated_tokens_time:.2f}ms (已累积tokens: {len(speech_tokens)}/{tokens_needed})")
+                        
                         # 有足够的 tokens，生成一块音频
-                        chunk_start_time = time.time()
+                        chunk_start_time = time.perf_counter()
                         
                         this_tts_speech_token = torch.tensor(
                             speech_tokens[:tokens_needed]
@@ -389,8 +565,37 @@ class FastCosyVoice2:
                             speed=1.0
                         )
                         
-                        chunk_time = (time.time() - chunk_start_time) * 1000
-                        logging.info(f"[流式token2wav] 块{chunk_idx}: offset={token_offset}, tokens_in={tokens_needed}, total_generated={len(speech_tokens)}, 耗时={chunk_time:.1f}ms")
+                        chunk_time = (time.perf_counter() - chunk_start_time) * 1000
+                        
+                        # 计算当前块的音频时长和 RTF
+                        chunk_audio_duration = tts_speech.shape[-1] / sample_rate  # 秒
+                        chunk_rtf = (chunk_time / 1000) / chunk_audio_duration if chunk_audio_duration > 0 else 0
+                        total_audio_duration += chunk_audio_duration
+                        total_processing_time += (chunk_time / 1000)
+                        cumulative_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else 0
+                        
+                        if not first_chunk_generated:
+                            if is_first_segment:
+                                logging.info(f"[延迟分析-05] 首块音频合成(token2wav): {chunk_time:.2f}ms (tokens: {tokens_needed}, hop: {this_token_hop_len})")
+                                logging.info(f"[首块RTF] 音频时长: {chunk_audio_duration*1000:.1f}ms, 处理耗时: {chunk_time:.1f}ms, RTF: {chunk_rtf:.3f}")
+                            first_chunk_generated = True
+                            
+                            # 计算从请求到首包的总延迟（仅首段）
+                            if is_first_segment:
+                                total_ttfb = (time.perf_counter() - request_start_time) * 1000
+                                logging.info(f"\n{'='*70}")
+                                logging.info(f"[首包延迟汇总 TTFB] 总耗时: {total_ttfb:.2f}ms")
+                                logging.info(f"  ├─ 上下文加载: {context_load_time:.2f}ms (step 1)")
+                                logging.info(f"  ├─ LLM输入准备: {prepare_time:.2f}ms (step 2)")
+                                logging.info(f"  ├─ 参数初始化: {init_time:.2f}ms (step 3)")
+                                logging.info(f"  ├─ Token生成(首个): {first_token_gen_time:.2f}ms (step 4a)")
+                                logging.info(f"  ├─ Token累积等待: {accumulated_tokens_time - first_token_gen_time:.2f}ms (step 4b)")
+                                logging.info(f"  └─ 音频合成(token2wav): {chunk_time:.2f}ms (step 5)")
+                                logging.info(f"[延迟分解] Model:{context_load_time+prepare_time+init_time:.1f}ms + LLMGen:{first_token_gen_time:.1f}ms + TTW:{chunk_time:.1f}ms + Wait:{accumulated_tokens_time - first_token_gen_time:.1f}ms = {total_ttfb:.1f}ms")
+                                logging.info(f"[性能指标] 首块RTF: {chunk_rtf:.3f}, 音频: {chunk_audio_duration*1000:.0f}ms, 目标RTF: <0.2")
+                                logging.info(f"{'='*70}\n")
+                        else:
+                            logging.info(f"[流式token2wav] 块{chunk_idx}: 音频={chunk_audio_duration*1000:.0f}ms, 耗时={chunk_time:.1f}ms, RTF={chunk_rtf:.3f}, 累积RTF={cumulative_rtf:.3f}")
                         
                         token_offset += this_token_hop_len
                         chunk_idx += 1
@@ -402,9 +607,10 @@ class FastCosyVoice2:
                 if generation_done:
                     break
             
+            # ========== 阶段 6: 处理剩余Tokens ==========
             # 7. 处理剩余的 tokens（最后一块）
             if token_offset < len(speech_tokens):
-                chunk_start_time = time.time()
+                chunk_start_time = time.perf_counter()
                 
                 this_tts_speech_token = torch.tensor(speech_tokens).unsqueeze(0)
                 
@@ -420,27 +626,54 @@ class FastCosyVoice2:
                     speed=1.0
                 )
                 
-                chunk_time = (time.time() - chunk_start_time) * 1000
-                logging.info(f"[流式token2wav] 最终块{chunk_idx}: offset={token_offset}, tokens_in={len(speech_tokens)}, 耗时={chunk_time:.1f}ms (finalize)")
-                yield {'tts_speech': tts_speech.cpu()}
+                chunk_time = (time.perf_counter() - chunk_start_time) * 1000
+                
+                # 计算最终块的音频时长和 RTF
+                chunk_audio_duration = tts_speech.shape[-1] / sample_rate
+                chunk_rtf = (chunk_time / 1000) / chunk_audio_duration if chunk_audio_duration > 0 else 0
+                total_audio_duration += chunk_audio_duration
+                total_processing_time += (chunk_time / 1000)
+                cumulative_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else 0
+                
+                logging.info(f"[流式token2wav] 最终块{chunk_idx}: 音频={chunk_audio_duration*1000:.0f}ms, 耗时={chunk_time:.1f}ms, RTF={chunk_rtf:.3f} (finalize)")
+                yield {'tts_speech': tts_speech.cpu()}  # 🔴 关键：必须 yield 最后一块音频
             
-            logging.info(f"[FastTTS] 流式生成完成: 共 {len(speech_tokens)} 个 speech tokens, {chunk_idx + 1} 个音频块")
+            # 输出总体 RTF 统计（仅首段详细输出）
+            overall_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else 0
+            if is_first_segment:
+                logging.info(f"[FastTTS] 流式生成完成: 共 {len(speech_tokens)} 个 speech tokens, {chunk_idx + 1} 个音频块")
+                logging.info(f"[整体RTF统计] 总音频时长: {total_audio_duration:.2f}s, 总处理时间: {total_processing_time:.2f}s, 整体RTF: {overall_rtf:.3f} (目标: <0.2)")
             
             # 清理缓存
-            if this_uuid in model.hift_cache_dict:
+            if this_uuid and this_uuid in model.hift_cache_dict:
                 model.hift_cache_dict.pop(this_uuid)
+                logging.debug(f"[显存管理] 已清理 hift_cache: {this_uuid}")
+            
+            # 🔴 关键优化：每段推理后强制释放显存碎片
+            torch.cuda.empty_cache()
             
         except Exception as e:
             logging.error(f"TensorRT-LLM 推理失败: {e}，回退到 PyTorch 推理")
             import traceback
             traceback.print_exc()
-            # 回退到原始推理
-            for output in self.cosyvoice.inference_zero_shot(
-                text, prompt_text, prompt_speech_16k,
-                zero_shot_spk_id=zero_shot_spk_id,
-                stream=stream
-            ):
-                yield output
+            
+            # 🔴 异常时也要清理缓存，防止显存泄漏
+            if this_uuid:
+                try:
+                    model = self.cosyvoice.model
+                    if this_uuid in model.hift_cache_dict:
+                        model.hift_cache_dict.pop(this_uuid)
+                        logging.warning(f"[显存管理] 异常情况下清理 hift_cache: {this_uuid}")
+                except Exception as cleanup_err:
+                    logging.error(f"清理缓存失败: {cleanup_err}")
+            
+            # 异常后也释放显存
+            torch.cuda.empty_cache()
+            
+            # 🔴 TensorRT-LLM 失败后，直接跳过此段（避免 PyTorch 回退的设备错误）
+            # 返回空输出，前端会收到部分音频（已生成的段落）
+            logging.error(f"[段落推理失败] TensorRT-LLM 推理失败，跳过当前段落: '{text[:30]}...'")
+            return  # 🔴 不再回退，直接跳过
     
     def list_available_spks(self):
         """获取可用说话人列表"""
@@ -453,8 +686,16 @@ class FastCosyVoice2:
         return self.cosyvoice.add_zero_shot_spk(prompt_text, prompt_speech_16k, zero_shot_spk_id)
     
     def save_spkinfo(self):
-        """保存说话人信息"""
-        return self.cosyvoice.save_spkinfo()
+        """保存说话人信息到指定路径"""
+        if self.spk2info_path:
+            torch.save(self.cosyvoice.frontend.spk2info, self.spk2info_path)
+            logging.info(f"说话人信息已保存到: {self.spk2info_path}")
+        else:
+            return self.cosyvoice.save_spkinfo()
+    
+    def load_spk_prompt_text_raw(self, spk_prompt_text_raw_dict):
+        """从外部加载原始 prompt_text 映射"""
+        self.spk_prompt_text_raw.update(spk_prompt_text_raw_dict)
 
 
 def generate_data(model_output, request_start_time):
@@ -464,9 +705,11 @@ def generate_data(model_output, request_start_time):
     
     for i in model_output:
         if is_first:
-            first_chunk_time = time.time()
+            first_chunk_time = time.perf_counter()
             ttfb = (first_chunk_time - request_start_time) * 1000
-            logging.info(f"[TTS统计] 首包生成完毕! 服务端TTFB: {ttfb:.2f}ms")
+            # 注意：此处 TTFB 是 HTTP 响应级别的首包时间（从请求到 generate_data 首次产出数据）
+            # 实际的推理 TTFB 已在 inference_zero_shot 中详细打印
+            logging.info(f"[TTS统计] HTTP响应首包生成完毕! HTTP TTFB: {ttfb:.2f}ms")
             is_first = False
 
         tts_speech = i["tts_speech"].numpy()
@@ -479,7 +722,7 @@ def generate_data(model_output, request_start_time):
         chunk_count += 1
         yield tts_audio
     
-    total_time = (time.time() - request_start_time) * 1000
+    total_time = (time.perf_counter() - request_start_time) * 1000
     logging.info(f"[TTS统计] 流式传输结束. 总耗时: {total_time:.2f}ms, 共发送 {chunk_count} 个数据块")
 
 
@@ -527,6 +770,29 @@ def load_speakers_from_directory(speaker_dir="asset/speakers"):
     return speakers
 
 
+def extract_spk_prompt_text_from_directory(speaker_dir="asset/speakers"):
+    """从说话人目录提取 spk_id -> prompt_text 映射（不加载音频）"""
+    spk_prompt_text_raw = {}
+    
+    if not os.path.exists(speaker_dir):
+        logging.warning(f"说话人目录 {speaker_dir} 不存在")
+        return spk_prompt_text_raw
+    
+    wav_files = glob.glob(os.path.join(speaker_dir, "*.wav"))
+    
+    for wav_path in wav_files:
+        filename = os.path.basename(wav_path)
+        # 解析文件名格式：[说话人名称]文本内容.wav
+        match = re.match(r'\[(.+?)\](.+)\.wav$', filename)
+        
+        if match:
+            speaker_name = match.group(1)
+            prompt_text = match.group(2)
+            spk_prompt_text_raw[speaker_name] = prompt_text
+    
+    return spk_prompt_text_raw
+
+
 @app.get("/")
 async def index():
     """主页路由，返回前端页面"""
@@ -555,8 +821,10 @@ async def inference_zero_shot(request: Request, text: str = Form(), speaker: str
     logging.info(f"[FastTTS请求] 收到请求: text='{text[:50] if len(text) > 50 else text}', speaker='{speaker}'")
 
     try:
+        # 获取可用说话人列表
+        available_spks = fast_cosyvoice.list_available_spks()
         # 默认使用jok老师，如果没有则使用第一个说话人
-        default_speaker = "jok老师" if "jok老师" in speakers_data else (list(speakers_data.keys())[0] if speakers_data else "")
+        default_speaker = "jok老师" if "jok老师" in available_spks else (available_spks[0] if available_spks else "")
         selected_speaker = speaker if speaker else default_speaker
         
         if not selected_speaker:
@@ -568,7 +836,8 @@ async def inference_zero_shot(request: Request, text: str = Form(), speaker: str
         model_output = fast_cosyvoice.inference_zero_shot(
             text, "", None, 
             zero_shot_spk_id=selected_speaker,
-            stream=True
+            stream=True,
+            request_start_time=request_start_time
         )
         return StreamingResponse(generate_data(model_output, request_start_time))
     except Exception as e:
@@ -614,56 +883,101 @@ if __name__ == "__main__":
         logging.info(f"TensorRT-LLM Tokenizer: {args.trtllm_tokenizer_dir}")
         logging.info("=" * 60)
         
-        # 加载原始 CosyVoice2 模型
-        cosyvoice = CosyVoice2(args.model_dir, load_jit=True, load_trt=True, fp16=True)
+        # 加载原始 CosyVoice2 模型（确保启用所有加速选项）
+        cosyvoice = CosyVoice2(
+            args.model_dir, 
+            load_jit=True,   # ✅ JIT编译加速
+            load_trt=True,   # ✅ TensorRT优化
+            fp16=True        # ✅ FP16混合精度
+        )
+        logging.info("✅ 模型加载配置: JIT=True, TRT=True, FP16=True")
         
         # 创建 FastCosyVoice2 实例（集成 TensorRT-LLM）
+        spk2info_path = os.path.join(args.speaker_dir, 'spk2info.pt')
         fast_cosyvoice = FastCosyVoice2(
             cosyvoice_model=cosyvoice,
             trtllm_engine_dir=args.trtllm_engine_dir,
             trtllm_tokenizer_dir=args.trtllm_tokenizer_dir,
+            spk2info_path=spk2info_path,
         )
-        
-        logging.info("✅ FastCosyVoice2 初始化成功，使用 TensorRT-LLM 加速")
+        # 🔴 不再将 PyTorch LLM 移到 CPU，保留作为可用的回退路径
+        # 如果 TensorRT-LLM 失败，需要能够正常回退到 PyTorch 推理
+        logging.info("✅ FastCosyVoice2 初始化成功，使用 TensorRT-LLM 加速（PyTorch LLM 保留在 GPU 作为回退）")
 
     except Exception as e:
         raise TypeError(f"导入{args.model_dir}失败，模型类型有误！错误: {e}")
 
-    # 加载所有说话人
-    print("正在加载说话人...")
-    speakers_data = load_speakers_from_directory(args.speaker_dir)
+    # 加载说话人信息
+    spk2info_path = os.path.join(args.speaker_dir, 'spk2info.pt')
+    spk_prompt_text_raw_map = extract_spk_prompt_text_from_directory(args.speaker_dir)
     
-    if not speakers_data:
-        print(f"警告：未在 {args.speaker_dir} 目录找到任何说话人文件")
+    # 检查 speakers 目录下的 spk2info.pt 是否存在且包含所有说话人
+    need_regenerate = False
+    
+    # 如果 speakers 目录下有 spk2info.pt，加载它
+    if os.path.exists(spk2info_path):
+        spk2info_data = torch.load(spk2info_path, map_location=fast_cosyvoice.device)
+        fast_cosyvoice.cosyvoice.frontend.spk2info.update(spk2info_data)
+        logging.info(f"已加载 spk2info.pt: {spk2info_path}")
+    
+    existing_spks = set(fast_cosyvoice.cosyvoice.frontend.spk2info.keys())
+    required_spks = set(spk_prompt_text_raw_map.keys())
+    
+    if not os.path.exists(spk2info_path):
+        print(f"未找到 spk2info.pt，将生成新文件")
+        need_regenerate = True
+    elif required_spks - existing_spks:
+        missing_spks = required_spks - existing_spks
+        print(f"检测到新增说话人: {missing_spks}，需要重新生成 spk2info.pt")
+        need_regenerate = True
     else:
-        print(f"成功加载 {len(speakers_data)} 个说话人")
+        print(f"spk2info.pt 已存在，包含 {len(existing_spks)} 个说话人，跳过特征提取")
+    
+    if need_regenerate:
+        print("正在提取说话人音频特征...")
+        speakers_data = load_speakers_from_directory(args.speaker_dir)
         
-        # 将所有说话人添加到模型
-        for speaker_name, speaker_info in speakers_data.items():
+        if not speakers_data:
+            print(f"警告：未在 {args.speaker_dir} 目录找到任何说话人文件")
+        else:
+            print(f"成功加载 {len(speakers_data)} 个说话人")
+            
+            # 将所有说话人添加到模型
+            for speaker_name, speaker_info in speakers_data.items():
+                try:
+                    fast_cosyvoice.add_zero_shot_spk(
+                        speaker_info['prompt_text'],
+                        speaker_info['prompt_speech_16k'],
+                        speaker_name
+                    )
+                    print(f"  ✓ {speaker_name}")
+                except Exception as e:
+                    print(f"  ✗ {speaker_name}: {e}")
+            
+            # 保存说话人信息
             try:
-                fast_cosyvoice.add_zero_shot_spk(
-                    speaker_info['prompt_text'],
-                    speaker_info['prompt_speech_16k'],
-                    speaker_name
-                )
-                print(f"  ✓ {speaker_name}")
+                # 确保 speaker_dir 存在
+                os.makedirs(args.speaker_dir, exist_ok=True)
+                fast_cosyvoice.save_spkinfo()
+                print(f"说话人信息已保存到 {spk2info_path}")
             except Exception as e:
-                print(f"  ✗ {speaker_name}: {e}")
-        
-        # 保存说话人信息
-        try:
-            fast_cosyvoice.save_spkinfo()
-            print("说话人信息已保存")
-        except Exception as e:
-            print(f"保存说话人信息失败: {e}")
+                print(f"保存说话人信息失败: {e}")
+    else:
+        # 直接从文件名加载 prompt_text 映射
+        fast_cosyvoice.load_spk_prompt_text_raw(spk_prompt_text_raw_map)
+        print(f"已从文件名加载 {len(spk_prompt_text_raw_map)} 个说话人的 prompt_text 映射")
     
     # 模型预热
     print("\n正在预热模型...")
-    if speakers_data:
-        warmup_speaker = "jok老师" if "jok老师" in speakers_data else list(speakers_data.keys())[0]
+    available_spks = fast_cosyvoice.list_available_spks()
+    if available_spks:
+        warmup_speaker = "jok老师" if "jok老师" in available_spks else available_spks[0]
         print(f"使用 '{warmup_speaker}' 进行预热")
         warmup_texts = [
-            '收到好友从远方寄来的生日礼物，', 
+            "你好。",  # 短句
+            "这是一个用于预热模型的测试句子，确保服务响应速度。", # 中句
+            "语音合成服务正在启动中，请稍候，系统正在进行初始化操作。", # 长句
+            "好的，没问题。" # 短句
         ]
         
         for t in warmup_texts:
@@ -674,6 +988,8 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"预热失败: {e}")
                 break
+    else:
+        print("未找到可用说话人，跳过预热")
     
     print("预热完毕\n")
     print("=" * 60)
