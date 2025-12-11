@@ -149,14 +149,6 @@ def split_text_by_punctuation(text, max_length=100):
     return segments
 
 
-def log_gpu_memory(prefix=""):
-    """记录GPU显存使用情况"""
-    if torch.cuda.is_available():
-        allocated = torch.cuda.memory_allocated() / 1024**3  # GB
-        reserved = torch.cuda.memory_reserved() / 1024**3    # GB
-        logging.info(f"[显存监控{' - ' + prefix if prefix else ''}] 已分配: {allocated:.2f}GB, 已预留: {reserved:.2f}GB")
-
-
 def convert_speech_tokens_to_str(speech_tokens):
     """将 speech token IDs 转换为 <|s_XXXXX|> 格式的字符串"""
     if isinstance(speech_tokens, torch.Tensor):
@@ -189,7 +181,6 @@ class FastCosyVoice2:
         self.trtllm_tokenizer = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.spk2info_path = spk2info_path  # 保存 spk2info.pt 的路径
-        self._request_id_counter = 0  # 🔴 添加 request_id 计数器，避免 TensorRT-LLM 状态冲突
         
         # 存储原始的 prompt_text 字符串，用于 TensorRT-LLM
         self.spk_prompt_text_raw = {}
@@ -280,14 +271,10 @@ class FastCosyVoice2:
         try:
             input_length = input_ids.shape[1]
             
-            # 🔴 生成唯一的 request_id，避免 TensorRT-LLM 内部状态冲突
-            self._request_id_counter += 1
-            request_id = self._request_id_counter
-            
             # TensorRT-LLM 流式生成
             outputs_iter = self.trtllm_runner.generate(
                 batch_input_ids=[input_ids[0]],
-                max_new_tokens=1024,  # 🔴 从2048降低到1024，减少 KV Cache 占用
+                max_new_tokens=2048,
                 end_id=self.eos_token_id,
                 pad_id=self.eos_token_id,
                 temperature=0.8,
@@ -394,16 +381,14 @@ class FastCosyVoice2:
             request_start_time = time.perf_counter()
         
         # ========== 长文本分段预处理 ==========
-        # 🔴 激进策略：每段≤30字符，最大程度控制显存峰值
-        # 原因：TensorRT-LLM 的 KV Cache 会随输入长度线性增长
-        text_segments = split_text_by_punctuation(text, max_length=30)
+        # 智能切分文本：每段≤100字符，避免显存暴涨
+        text_segments = split_text_by_punctuation(text, max_length=100)
         
         if len(text_segments) == 0:
             logging.warning("[文本分段] 输入文本为空，跳过推理")
             return
         
         logging.info(f"[长文本处理] 原始文本 {len(text)} 字符 → 分成 {len(text_segments)} 段进行流式推理")
-        log_gpu_memory("分段前")
         
         # ========== 逐段推理并流式返回 ==========
         for segment_idx, text_segment in enumerate(text_segments):
@@ -422,27 +407,20 @@ class FastCosyVoice2:
             
             segment_time = (time.perf_counter() - segment_start_time) * 1000
             logging.info(f"[段落推理 {segment_idx+1}/{len(text_segments)}] 完成，耗时: {segment_time:.2f}ms")
-            log_gpu_memory(f"段{segment_idx+1}完成后")  # 🔴 每段后监控显存
     
     def _inference_single_segment(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id='', stream=True, request_start_time=None, is_first_segment=True):
         """单段文本推理（原 inference_zero_shot 的核心逻辑）"""
-        # 🔴 关键决策：分段场景下全部使用 PyTorch 推理
-        # 原因：TensorRT-LLM 在多次调用时有 request_id 冲突 + KV Cache 累积问题
-        # PyTorch 推理虽然慢一些，但显存可控且稳定
-        for output in self.cosyvoice.inference_zero_shot(
-            text, prompt_text, prompt_speech_16k, 
-            zero_shot_spk_id=zero_shot_spk_id, 
-            stream=stream
-        ):
-            yield output
-        
-        # 🔴 每段推理后强制同步 GPU 并清理缓存
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        return
+        if not self.use_trtllm:
+            # 回退到原始 CosyVoice2 推理
+            for output in self.cosyvoice.inference_zero_shot(
+                text, prompt_text, prompt_speech_16k, 
+                zero_shot_spk_id=zero_shot_spk_id, 
+                stream=stream
+            ):
+                yield output
+            return
         
         # 使用 TensorRT-LLM 加速的推理流程（流式生成 + 流式 token2wav）
-        this_uuid = None  # 提前声明，确保异常时也能清理
         try:
             # ========== 阶段 1: 上下文加载 ==========
             context_start = time.perf_counter()
@@ -645,35 +623,20 @@ class FastCosyVoice2:
                 logging.info(f"[整体RTF统计] 总音频时长: {total_audio_duration:.2f}s, 总处理时间: {total_processing_time:.2f}s, 整体RTF: {overall_rtf:.3f} (目标: <0.2)")
             
             # 清理缓存
-            if this_uuid and this_uuid in model.hift_cache_dict:
+            if this_uuid in model.hift_cache_dict:
                 model.hift_cache_dict.pop(this_uuid)
-                logging.debug(f"[显存管理] 已清理 hift_cache: {this_uuid}")
-            
-            # 🔴 关键优化：每段推理后强制释放显存碎片
-            torch.cuda.empty_cache()
             
         except Exception as e:
             logging.error(f"TensorRT-LLM 推理失败: {e}，回退到 PyTorch 推理")
             import traceback
             traceback.print_exc()
-            
-            # 🔴 异常时也要清理缓存，防止显存泄漏
-            if this_uuid:
-                try:
-                    model = self.cosyvoice.model
-                    if this_uuid in model.hift_cache_dict:
-                        model.hift_cache_dict.pop(this_uuid)
-                        logging.warning(f"[显存管理] 异常情况下清理 hift_cache: {this_uuid}")
-                except Exception as cleanup_err:
-                    logging.error(f"清理缓存失败: {cleanup_err}")
-            
-            # 异常后也释放显存
-            torch.cuda.empty_cache()
-            
-            # 🔴 TensorRT-LLM 失败后，直接跳过此段（避免 PyTorch 回退的设备错误）
-            # 返回空输出，前端会收到部分音频（已生成的段落）
-            logging.error(f"[段落推理失败] TensorRT-LLM 推理失败，跳过当前段落: '{text[:30]}...'")
-            return  # 🔴 不再回退，直接跳过
+            # 回退到原始推理
+            for output in self.cosyvoice.inference_zero_shot(
+                text, prompt_text, prompt_speech_16k,
+                zero_shot_spk_id=zero_shot_spk_id,
+                stream=stream
+            ):
+                yield output
     
     def list_available_spks(self):
         """获取可用说话人列表"""
@@ -900,9 +863,14 @@ if __name__ == "__main__":
             trtllm_tokenizer_dir=args.trtllm_tokenizer_dir,
             spk2info_path=spk2info_path,
         )
-        # 🔴 不再将 PyTorch LLM 移到 CPU，保留作为可用的回退路径
-        # 如果 TensorRT-LLM 失败，需要能够正常回退到 PyTorch 推理
-        logging.info("✅ FastCosyVoice2 初始化成功，使用 TensorRT-LLM 加速（PyTorch LLM 保留在 GPU 作为回退）")
+        try:
+            # 把 PyTorch LLM 移到 CPU，释放 GPU 显存
+            fast_cosyvoice.cosyvoice.model.llm.to("cpu")
+            torch.cuda.empty_cache()
+            logging.info("已将 CosyVoice2 PyTorch LLM 移至 CPU，释放 GPU 显存")
+        except Exception as e:
+            logging.warning(f"移动 CosyVoice2 LLM 到 CPU 失败: {e}")
+        logging.info("✅ FastCosyVoice2 初始化成功，使用 TensorRT-LLM 加速")
 
     except Exception as e:
         raise TypeError(f"导入{args.model_dir}失败，模型类型有误！错误: {e}")
