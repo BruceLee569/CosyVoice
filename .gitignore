@@ -68,5 +68,4 @@ trt_engines_bfloat16/
 trt_weights_bfloat16/
 cosyvoice2_llm/
 
-asset/
-
+dist_heavy/
