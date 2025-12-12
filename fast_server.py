@@ -677,11 +677,11 @@ def generate_data(model_output, request_start_time):
 
         tts_speech = i["tts_speech"].numpy()
         
-        # 2. 输出端削波：防止 float -> int16 转换时的整数溢出
+        # 输出端削波：防止 float -> int16 转换时的整数溢出
         tts_speech = np.clip(tts_speech, -1.0, 1.0)
         
         # 转换为 int16 格式
-        tts_audio = (tts_speech * 32767).astype(np.int16).tobytes()
+        tts_audio = (tts_speech * 32767.0).astype(np.int16).tobytes()
         chunk_count += 1
         yield tts_audio
     
