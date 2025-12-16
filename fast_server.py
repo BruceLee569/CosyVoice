@@ -5,6 +5,9 @@ import argparse
 import logging
 import re
 import glob
+import json
+from functools import partial
+import inflect
 
 # 配置日志格式，确保显示毫秒级时间戳
 logging.basicConfig(
@@ -13,6 +16,7 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -37,8 +41,25 @@ except ImportError as e:
 
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
-import threading
+from cosyvoice.utils.frontend_utils import (
+    contains_chinese, replace_blank, replace_corner_mark, 
+    remove_bracket, spell_out_number, split_paragraph, is_only_punctuation
+)
 import uuid as uuid_module
+
+# 导入 ttsfrd 模块（用于文本规范化）
+try:
+    import ttsfrd
+    USE_TTSFRD = True
+    logging.info("已导入 ttsfrd 模块用于文本规范化")
+except ImportError:
+    USE_TTSFRD = False
+    logging.warning("ttsfrd 不可用，将使用 wetext 进行文本规范化")
+    try:
+        from wetext import Normalizer as ZhNormalizer
+        from wetext import Normalizer as EnNormalizer
+    except ImportError:
+        logging.warning("wetext 也不可用，文本规范化功能将受限")
 
 app = FastAPI()
 
@@ -52,7 +73,7 @@ class TimingMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(TimingMiddleware)
 
-# set cross region allowance
+# 设置同源策略
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -79,74 +100,111 @@ TRTLLM_CHAT_TEMPLATE = (
 )
 
 
-def split_text_by_punctuation(text, max_length=100):
-    """根据标点符号智能切分文本，确保每段长度可控
+class TextNormalizer:
+    """文本规范化工具类，复用 CosyVoice frontend 的成熟实现"""
     
-    Args:
-        text: 输入文本
-        max_length: 每段最大字符数（默认100，保证引擎输入安全）
-    
-    Returns:
-        List[str]: 切分后的文本段落列表
-    """
-    # 定义分段标点符号（按优先级排序）
-    primary_punctuations = ['。', '！', '？', '；', '.', '!', '?', ';']
-    secondary_punctuations = ['，', '、', ',', '\n']
-    
-    if len(text) <= max_length:
-        return [text] if text.strip() else []
-    
-    segments = []
-    current_segment = ""
-    
-    i = 0
-    while i < len(text):
-        char = text[i]
-        current_segment += char
+    def __init__(self, tokenizer, use_ttsfrd=True):
+        self.tokenizer = tokenizer
+        self.use_ttsfrd = use_ttsfrd
         
-        # 如果当前段落已达到最大长度
-        if len(current_segment) >= max_length:
-            # 尝试在主要标点处切分
-            last_primary_idx = -1
-            for j in range(len(current_segment) - 1, -1, -1):
-                if current_segment[j] in primary_punctuations:
-                    last_primary_idx = j
-                    break
-            
-            if last_primary_idx > 0:
-                # 在主要标点处切分
-                segments.append(current_segment[:last_primary_idx + 1].strip())
-                current_segment = current_segment[last_primary_idx + 1:]
-            else:
-                # 尝试在次要标点处切分
-                last_secondary_idx = -1
-                for j in range(len(current_segment) - 1, -1, -1):
-                    if current_segment[j] in secondary_punctuations:
-                        last_secondary_idx = j
-                        break
-                
-                if last_secondary_idx > 0:
-                    segments.append(current_segment[:last_secondary_idx + 1].strip())
-                    current_segment = current_segment[last_secondary_idx + 1:]
+        if self.use_ttsfrd:
+            self.frd = ttsfrd.TtsFrontendEngine()
+            # 初始化 ttsfrd 资源（使用项目中的资源目录）
+            resource_dir = os.path.join(os.path.dirname(__file__), 'pretrained_models/CosyVoice-ttsfrd/resource')
+            if os.path.exists(resource_dir):
+                if not self.frd.initialize(resource_dir):
+                    logging.warning(f"ttsfrd 初始化失败，将使用 wetext")
+                    self.use_ttsfrd = False
+                    self._init_wetext()
                 else:
-                    # 强制在当前位置切分（紧急情况）
-                    segments.append(current_segment.strip())
-                    current_segment = ""
+                    self.frd.set_lang_type('pinyinvg')
+                    logging.info("✅ ttsfrd 初始化成功")
+            else:
+                logging.warning(f"ttsfrd 资源目录不存在: {resource_dir}，将使用 wetext")
+                self.use_ttsfrd = False
+                self._init_wetext()
+        else:
+            self._init_wetext()
+    
+    def _init_wetext(self):
+        """初始化 wetext 规范化器（回退方案）"""
+        if 'ZhNormalizer' in globals():
+            self.zh_tn_model = ZhNormalizer(remove_erhua=False)
+            self.en_tn_model = EnNormalizer()
+            self.inflect_parser = inflect.engine()
+            logging.info("使用 wetext 作为文本规范化工具")
+        else:
+            logging.warning("wetext 不可用，将跳过文本规范化")
+    
+    def normalize_and_split(self, text, token_max_n=80, token_min_n=60):
+        """文本规范化与智能分段（复用 frontend.text_normalize 逻辑）
         
-        i += 1
-    
-    # 添加最后一段
-    if current_segment.strip():
-        segments.append(current_segment.strip())
-    
-    # 过滤空段落
-    segments = [s for s in segments if s.strip()]
-    
-    logging.info(f"[文本分段] 原始长度: {len(text)} 字符, 分成 {len(segments)} 段, 每段≤{max_length}字符")
-    for idx, seg in enumerate(segments):
-        logging.info(f"  段{idx+1}: {len(seg)}字符 - '{seg[:30]}{'...' if len(seg) > 30 else ''}'")
-    
-    return segments
+        Args:
+            text: 输入文本
+            token_max_n: 最大 token 数（默认 80）
+            token_min_n: 最小 token 数（默认 60）
+        
+        Returns:
+            List[str]: 规范化并切分后的文本段落列表
+        """
+        if not text or text.strip() == '':
+            return []
+        
+        text = text.strip()
+        
+        # 使用 ttsfrd 进行文本规范化
+        if self.use_ttsfrd:
+            try:
+                result = self.frd.do_voicegen_frd(text)
+                texts = [i["text"] for i in json.loads(result)["sentences"]]
+                text = ''.join(texts)
+            except Exception as e:
+                logging.warning(f"ttsfrd 处理失败: {e}，使用原始文本")
+        else:
+            # 使用 wetext 进行规范化（与 frontend.py 逻辑一致）
+            if 'zh_tn_model' in dir(self):
+                if contains_chinese(text):
+                    text = self.zh_tn_model.normalize(text)
+                    text = text.replace("\n", "")
+                    text = replace_blank(text)
+                    text = replace_corner_mark(text)
+                    text = text.replace(".", "。")
+                    text = text.replace(" - ", "，")
+                    text = remove_bracket(text)
+                    text = re.sub(r'[，,、]+$', '。', text)
+                else:
+                    text = self.en_tn_model.normalize(text)
+                    text = spell_out_number(text, self.inflect_parser)
+        
+        # 使用 split_paragraph 进行智能分段（与 frontend.py 逻辑一致）
+        tokenize_fn = partial(self.tokenizer.encode, allowed_special='all')
+        
+        if contains_chinese(text):
+            texts = list(split_paragraph(
+                text, tokenize_fn, "zh", 
+                token_max_n=token_max_n,
+                token_min_n=token_min_n, 
+                merge_len=20, 
+                comma_split=False
+            ))
+        else:
+            texts = list(split_paragraph(
+                text, tokenize_fn, "en", 
+                token_max_n=token_max_n,
+                token_min_n=token_min_n, 
+                merge_len=20, 
+                comma_split=False
+            ))
+        
+        # 过滤纯标点段落
+        texts = [i for i in texts if not is_only_punctuation(i)]
+        
+        if texts:
+            logging.info(f"[文本规范化] 原始长度: {len(text)} 字符 → 分成 {len(texts)} 段")
+            for idx, seg in enumerate(texts):
+                logging.info(f"  段{idx+1}: {len(seg)}字符 - '{seg[:30]}{'...' if len(seg) > 30 else ''}'")
+        
+        return texts
 
 
 def convert_speech_tokens_to_str(speech_tokens):
@@ -174,9 +232,8 @@ def extract_speech_ids_from_str(speech_tokens_str_list):
 class FastCosyVoice2:
     """集成 TensorRT-LLM 的 CosyVoice2 推理类"""
     
-    def __init__(self, cosyvoice_model, trtllm_engine_dir=None, trtllm_tokenizer_dir=None, use_trtllm=True, spk2info_path=None):
+    def __init__(self, cosyvoice_model, trtllm_engine_dir, trtllm_tokenizer_dir, spk2info_path=None):
         self.cosyvoice : CosyVoice2 = cosyvoice_model
-        self.use_trtllm = use_trtllm and TRTLLM_AVAILABLE
         self.trtllm_runner = None
         self.trtllm_tokenizer = None
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -185,21 +242,26 @@ class FastCosyVoice2:
         # 存储原始的 prompt_text 字符串，用于 TensorRT-LLM
         self.spk_prompt_text_raw = {}
         
-        if self.use_trtllm:
-            try:
-                self._init_trtllm(trtllm_engine_dir, trtllm_tokenizer_dir)
-                logging.info("✅ TensorRT-LLM 初始化成功")
-            except Exception as e:
-                logging.error(f"TensorRT-LLM 初始化失败: {e}. 回退到 PyTorch 推理")
-                self.use_trtllm = False
+        # 初始化文本规范化器（使用 frontend 的成熟实现）
+        self.text_normalizer = None
+        
+        # 强制初始化 TensorRT-LLM（追求极致流式推理性能）
+        self._init_trtllm(trtllm_engine_dir, trtllm_tokenizer_dir)
+        logging.info("✅ TensorRT-LLM 初始化成功")
+        
+        # 初始化文本规范化器（在 TensorRT-LLM tokenizer 初始化后）
+        self.text_normalizer = TextNormalizer(
+            tokenizer=self.trtllm_tokenizer,
+            use_ttsfrd=USE_TTSFRD
+        )
     
     def _init_trtllm(self, engine_dir, tokenizer_dir):
         """初始化 TensorRT-LLM 引擎"""
         if not engine_dir or not os.path.exists(engine_dir):
             raise ValueError(f"TensorRT-LLM 引擎目录不存在: {engine_dir}")
         
+        # 获取当前进程的 MPI 排名
         runtime_rank = tensorrt_llm.mpi_rank()
-        
         # 初始化 tokenizer
         self.trtllm_tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
         
@@ -381,8 +443,12 @@ class FastCosyVoice2:
             request_start_time = time.perf_counter()
         
         # ========== 长文本分段预处理 ==========
-        # 智能切分文本：每段≤100字符，避免显存暴涨
-        text_segments = split_text_by_punctuation(text, max_length=100)
+        # 使用 frontend 的成熟实现：文本规范化 + 智能分段
+        text_segments = self.text_normalizer.normalize_and_split(
+            text, 
+            token_max_n=80,  # 与 frontend.py 保持一致
+            token_min_n=60
+        )
         
         if len(text_segments) == 0:
             logging.warning("[文本分段] 输入文本为空，跳过推理")
@@ -409,18 +475,7 @@ class FastCosyVoice2:
             logging.info(f"[段落推理 {segment_idx+1}/{len(text_segments)}] 完成，耗时: {segment_time:.2f}ms")
     
     def _inference_single_segment(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id='', stream=True, request_start_time=None, is_first_segment=True):
-        """单段文本推理（原 inference_zero_shot 的核心逻辑）"""
-        if not self.use_trtllm:
-            # 回退到原始 CosyVoice2 推理
-            for output in self.cosyvoice.inference_zero_shot(
-                text, prompt_text, prompt_speech_16k, 
-                zero_shot_spk_id=zero_shot_spk_id, 
-                stream=stream
-            ):
-                yield output
-            return
-        
-        # 使用 TensorRT-LLM 加速的推理流程（流式生成 + 流式 token2wav）
+        """单段文本推理（TensorRT-LLM 流式生成 + 流式 token2wav，原 inference_zero_shot 的核心逻辑）"""
         try:
             # ========== 阶段 1: 上下文加载 ==========
             context_start = time.perf_counter()
@@ -627,16 +682,10 @@ class FastCosyVoice2:
                 model.hift_cache_dict.pop(this_uuid)
             
         except Exception as e:
-            logging.error(f"TensorRT-LLM 推理失败: {e}，回退到 PyTorch 推理")
+            logging.error(f"TensorRT-LLM 推理失败: {e}")
             import traceback
             traceback.print_exc()
-            # 回退到原始推理
-            for output in self.cosyvoice.inference_zero_shot(
-                text, prompt_text, prompt_speech_16k,
-                zero_shot_spk_id=zero_shot_spk_id,
-                stream=stream
-            ):
-                yield output
+            raise  # 直接抛出异常，不回退到 PyTorch
     
     def list_available_spks(self):
         """获取可用说话人列表"""
@@ -810,7 +859,7 @@ async def inference_zero_shot(request: Request, text: str = Form(), speaker: str
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=6008, help="服务端口")
+    parser.add_argument("--port", type=int, default=50000, help="服务端口")
     parser.add_argument(
         "--model_dir",
         type=str,
@@ -820,13 +869,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--trtllm_engine_dir",
         type=str,
-        default="runtime/triton_trtllm/trt_engines_bfloat16",
+        default="pretrained_models/cosyvoice2_llm/trt_engines_bfloat16",
         help="TensorRT-LLM 引擎目录",
     )
     parser.add_argument(
         "--trtllm_tokenizer_dir",
         type=str,
-        default="runtime/triton_trtllm/cosyvoice2_llm",
+        default="pretrained_models/cosyvoice2_llm",
         help="TensorRT-LLM tokenizer 目录",
     )
     parser.add_argument(
