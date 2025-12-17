@@ -69,3 +69,4 @@ trt_weights_bfloat16/
 cosyvoice2_llm/
 
 dist_heavy/
+model.cache

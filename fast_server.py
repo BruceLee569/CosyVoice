@@ -39,6 +39,9 @@ except ImportError as e:
     TRTLLM_AVAILABLE = False
     logging.warning(f"TensorRT-LLM 不可用: {e}. 将使用原始 PyTorch 推理")
 
+# subprocess 用于执行 TensorRT-LLM 编译命令
+import subprocess
+
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from cosyvoice.utils.file_utils import load_wav
 from cosyvoice.utils.frontend_utils import (
@@ -98,6 +101,93 @@ TRTLLM_CHAT_TEMPLATE = (
     "{%- endif %}"
     "{%- endfor %}"
 )
+
+
+def build_trtllm_engine(model_dir, tokenizer_dir, engine_dir, dtype='bfloat16'):
+    """自动编译 TensorRT-LLM 引擎
+    
+    Args:
+        model_dir: HuggingFace 模型目录（用于转换 checkpoint）
+        tokenizer_dir: Tokenizer 目录
+        engine_dir: TensorRT 引擎输出目录
+        dtype: 数据类型（bfloat16/float16/float32）
+    """
+    logging.info("="*70)
+    logging.info("检测到 TensorRT-LLM 引擎不存在，开始自动编译...")
+    logging.info(f"  模型目录: {model_dir}")
+    logging.info(f"  引擎输出: {engine_dir}")
+    logging.info(f"  数据类型: {dtype}")
+    logging.info("="*70)
+    
+    # 创建临时权重目录
+    weights_dir = os.path.join(os.path.dirname(engine_dir), f"trt_weights_{dtype}")
+    os.makedirs(weights_dir, exist_ok=True)
+    os.makedirs(engine_dir, exist_ok=True)
+    
+    try:
+        # 阶段 1: 转换 checkpoint 到 TensorRT 权重格式
+        logging.info("[1/2] 正在转换 checkpoint 到 TensorRT 权重格式...")
+        convert_script = os.path.join(
+            os.path.dirname(__file__),
+            "runtime/triton_trtllm/scripts/convert_checkpoint.py"
+        )
+        
+        if not os.path.exists(convert_script):
+            raise FileNotFoundError(f"转换脚本不存在: {convert_script}")
+        
+        convert_cmd = [
+            sys.executable,  # 使用当前 Python 解释器
+            convert_script,
+            "--model_dir", model_dir,
+            "--output_dir", weights_dir,
+            "--dtype", dtype
+        ]
+        
+        logging.info(f"执行命令: {' '.join(convert_cmd)}")
+        result = subprocess.run(
+            convert_cmd,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        logging.info(f"✅ Checkpoint 转换成功")
+        if result.stdout:
+            logging.debug(result.stdout)
+        
+        # 阶段 2: 编译 TensorRT 引擎
+        logging.info("[2/2] 正在编译 TensorRT 引擎（这可能需要几分钟）...")
+        build_cmd = [
+            "trtllm-build",
+            "--checkpoint_dir", weights_dir,
+            "--output_dir", engine_dir,
+            "--max_batch_size", "16",
+            "--max_num_tokens", "32768",
+            "--gemm_plugin", dtype
+        ]
+        
+        logging.info(f"执行命令: {' '.join(build_cmd)}")
+        result = subprocess.run(
+            build_cmd,
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        logging.info(f"✅ TensorRT 引擎编译成功")
+        if result.stdout:
+            logging.debug(result.stdout)
+        
+        logging.info("="*70)
+        logging.info(f"🎉 TensorRT-LLM 引擎编译完成: {engine_dir}")
+        logging.info("="*70)
+        
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ TensorRT-LLM 引擎编译失败: {e}")
+        logging.error(f"stdout: {e.stdout}")
+        logging.error(f"stderr: {e.stderr}")
+        raise RuntimeError(f"TensorRT-LLM 引擎编译失败: {e.stderr}")
+    except Exception as e:
+        logging.error(f"❌ TensorRT-LLM 引擎编译过程出错: {e}")
+        raise
 
 
 class TextNormalizer:
@@ -257,8 +347,31 @@ class FastCosyVoice2:
     
     def _init_trtllm(self, engine_dir, tokenizer_dir):
         """初始化 TensorRT-LLM 引擎"""
-        if not engine_dir or not os.path.exists(engine_dir):
-            raise ValueError(f"TensorRT-LLM 引擎目录不存在: {engine_dir}")
+        # 如果引擎目录不存在，自动编译
+        if not os.path.exists(engine_dir):
+            logging.warning(f"TensorRT-LLM 引擎目录不存在: {engine_dir}")
+            
+            # 从 tokenizer_dir 推断模型目录（假设 tokenizer_dir 就是模型目录）
+            model_dir = tokenizer_dir
+            
+            # 自动提取 dtype（从目录名）
+            dtype = 'bfloat16'  # 默认值
+            if 'bfloat16' in engine_dir:
+                dtype = 'bfloat16'
+            elif 'float16' in engine_dir:
+                dtype = 'float16'
+            elif 'float32' in engine_dir:
+                dtype = 'float32'
+            
+            logging.info(f"将自动编译 TensorRT-LLM 引擎（dtype={dtype}）")
+            
+            # 调用自动编译函数
+            build_trtllm_engine(
+                model_dir=model_dir,
+                tokenizer_dir=tokenizer_dir,
+                engine_dir=engine_dir,
+                dtype=dtype
+            )
         
         # 获取当前进程的 MPI 排名
         runtime_rank = tensorrt_llm.mpi_rank()
@@ -898,7 +1011,7 @@ if __name__ == "__main__":
         # 加载原始 CosyVoice2 模型（确保启用所有加速选项）
         cosyvoice = CosyVoice2(
             args.model_dir, 
-            load_jit=True,   # ✅ JIT编译加速
+            load_jit=True,   # ✅ JIT编译加速 flow.encoder
             load_trt=True,   # ✅ TensorRT优化
             fp16=True        # ✅ FP16混合精度
         )
