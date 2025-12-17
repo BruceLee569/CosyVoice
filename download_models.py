@@ -33,6 +33,8 @@ import argparse
 import os
 import sys
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 # ========== 代理配置支持 ==========
 def setup_proxy_from_env():
@@ -88,10 +90,10 @@ MODELS = {
         "size": "~2.5GB"
     },
     "2.0-llm": {
-        "source": "huggingface",
-        "id": "yuekai/cosyvoice2_llm",
+        "source": "modelscope",
+        "id": "yunye007/cosyvoice2_llm",
         "dir": "pretrained_models/cosyvoice2_llm",
-        "description": "CosyVoice 2.0 LLM (HuggingFace)",
+        "description": "CosyVoice 2.0 LLM (ModelScope)",
         "size": "~2.5GB"
     },
     "300m": {
@@ -171,18 +173,23 @@ def is_model_incomplete(model_dir):
 
 
 def download_model_from_modelscope(model_id, model_dir, description):
-    """从 ModelScope 下载模型（支持断点续传）"""
+    """从 ModelScope 下载模型（支持断点续传 + 多线程加速）"""
     try:
         from modelscope import snapshot_download
         
         print("   正在从 ModelScope 下载... 这可能需要几分钟")
         print("   💡 支持断点续传: 网络中断后可重新运行脚本继续下载")
+        print("   🚀 使用 6 线程并发下载，配合多模型并行最大化带宽")
         if 'HTTP_PROXY' in os.environ or 'HTTPS_PROXY' in os.environ:
             print("   🔁 使用代理配置连接")
         
-        # ModelScope 的 snapshot_download 默认支持断点续传
-        # 如果目录已存在，会自动检查并继续下载缺失的文件
-        snapshot_download(model_id, local_dir=model_dir)
+        # ModelScope 的 snapshot_download 支持断点续传和多线程下载
+        # max_workers 参数控制并发下载线程数，建议 4-8 个线程
+        snapshot_download(
+            model_id, 
+            local_dir=model_dir,
+            max_workers=6  # 使用 6 个线程并发下载，配合多模型并行
+        )
         
         print_colored(f"✅ 下载完成: {description}", "green")
         return True
@@ -204,18 +211,23 @@ def download_model_from_modelscope(model_id, model_dir, description):
 
 
 def download_model_from_huggingface(model_id, model_dir, description):
-    """从 HuggingFace 下载模型（支持断点续传与代理）"""
+    """从 HuggingFace 下载模型（支持断点续传 + 多线程加速）"""
     try:
         from huggingface_hub import snapshot_download as hf_snapshot_download
         
         print("   正在从 HuggingFace 下载... 这可能需要几分钟")
         print("   💡 支持断点续传: 网络中断后可重新运行脚本继续下载")
+        print("   🚀 使用 6 线程并发下载，配合多模型并行最大化带宽")
         if 'HTTP_PROXY' in os.environ or 'HTTPS_PROXY' in os.environ:
             print("   🔁 使用代理配置连接")
         
-        # HuggingFace 的 snapshot_download 默认支持断点续传
-        # 如果目录已存在，会自动检查并继续下载缺失的文件
-        hf_snapshot_download(repo_id=model_id, local_dir=model_dir)
+        # HuggingFace 的 snapshot_download 支持断点续传和多线程下载
+        # max_workers 参数控制并发下载线程数
+        hf_snapshot_download(
+            repo_id=model_id, 
+            local_dir=model_dir,
+            max_workers=6  # 使用 6 个线程并发下载，配合多模型并行
+        )
         
         print_colored(f"✅ 下载完成: {description}", "green")
         return True
@@ -328,27 +340,48 @@ def main():
     # 创建模型目录
     os.makedirs("pretrained_models", exist_ok=True)
     
-    # 下载模型
+    # 下载模型（并行下载多个模型以跑满带宽）
     success_count = 0
     total_count = len(models_to_download)
     
-    print(f"计划下载 {total_count} 个模型\n")
+    print(f"计划下载 {total_count} 个模型")
+    print(f"🚀 使用并行下载策略，同时下载最多 3 个模型以最大化带宽利用\n")
     
+    # 预处理：清理强制重新下载或不完整的模型
+    import shutil
     for key, model in models_to_download.items():
-        # 如果强制下载，先删除已存在的模型
         if args.force and check_model_exists(model["dir"]):
             print(f"🗑️  删除已存在的模型: {model['dir']}")
-            import shutil
             shutil.rmtree(model["dir"])
         
-        # 检查是否为不完整下载（空目录）
         if is_model_incomplete(model["dir"]):
             print(f"⚠️  检测到不完整下载: {model['dir']}（为空目录，将删除后重新下载）")
-            import shutil
             shutil.rmtree(model["dir"])
+    
+    # 使用线程池并行下载多个模型
+    # max_workers=3 表示最多同时下载 3 个模型
+    # 每个模型内部还会使用 6 个线程下载文件，总共约 18 个并发连接
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        # 提交所有下载任务
+        future_to_model = {
+            executor.submit(
+                download_model, 
+                model["id"], 
+                model["dir"], 
+                model["description"], 
+                model["source"]
+            ): key
+            for key, model in models_to_download.items()
+        }
         
-        if download_model(model["id"], model["dir"], model["description"], model["source"]):
-            success_count += 1
+        # 等待所有任务完成并统计结果
+        for future in as_completed(future_to_model):
+            key = future_to_model[future]
+            try:
+                if future.result():
+                    success_count += 1
+            except Exception as e:
+                print_colored(f"❌ 模型 {key} 下载时发生异常: {e}", "red")
     
     # 总结
     print("\n" + "=" * 70)
