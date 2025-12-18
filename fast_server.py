@@ -632,11 +632,15 @@ class FastCosyVoice2:
             model = self.cosyvoice.model
             model.hift_cache_dict[this_uuid] = None
             
-            # 核心参数：保持原始对齐逻辑不变
-            token_hop_len = 25  # 标准 hop 长度（保持原始设置）
-            token_hop_len_first = 15  # 首块使用更小的 hop，减少等待
+            # 核心参数：越小首包延迟越低，但是容易追尾和影响音质
+            # 直观类比：
+            # token_hop_len：火车每站前进 16 公里
+            # token_hop_len_first：第一站因为要出站+对齐，所以先走 8 公里 + 对齐距离
+            # pre_lookahead_len：司机总要多往前看 3 公里
+            token_hop_len = 16  # 标准 hop 长度，太低容易追尾（默认25）
+            token_hop_len_first = 6 # 首块 tokens ，代表要等 LLM 累积多少个 token 才能开始第一块 token2wav（默认12）
             pre_lookahead_len = model.flow.pre_lookahead_len  # 前瞻长度 (3)
-            
+    
             # 关键：prompt_token_pad 必须基于标准 hop_len 计算，不能改变
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / token_hop_len) * token_hop_len - flow_prompt_speech_token.shape[1])
             
