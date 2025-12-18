@@ -184,11 +184,9 @@ def download_model_from_modelscope(model_id, model_dir, description):
             print("   🔁 使用代理配置连接")
         
         # ModelScope 的 snapshot_download 支持断点续传和多线程下载
-        # max_workers 参数控制并发下载线程数，建议 4-8 个线程
         snapshot_download(
             model_id, 
             local_dir=model_dir,
-            max_workers=6  # 使用 6 个线程并发下载，配合多模型并行
         )
         
         print_colored(f"✅ 下载完成: {description}", "green")
@@ -273,6 +271,20 @@ def main():
     # 为了支持代理配置，应该末尾执行脚本时已经针对了代理
     # 但为了保险起觑，也在这里执行一次
     setup_proxy_from_env()
+    
+    # 预导入模块以避免并行下载时的导入竞态条件
+    # 在多线程环境下，同时首次导入模块可能导致 ImportError
+    try:
+        import modelscope
+        print_colored("✓ 已加载 modelscope 模块", "blue")
+    except ImportError:
+        print_colored("⚠️  未安装 modelscope，ModelScope 下载将不可用", "yellow")
+    
+    try:
+        import huggingface_hub
+        print_colored("✓ 已加载 huggingface_hub 模块", "blue")
+    except ImportError:
+        print_colored("⚠️  未安装 huggingface_hub，HuggingFace 下载将不可用", "yellow")
     
     parser = argparse.ArgumentParser(
         description="CosyVoice 模型下载工具",

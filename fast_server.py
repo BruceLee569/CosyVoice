@@ -126,33 +126,37 @@ def build_trtllm_engine(model_dir, tokenizer_dir, engine_dir, dtype='bfloat16'):
     
     try:
         # 阶段 1: 转换 checkpoint 到 TensorRT 权重格式
-        logging.info("[1/2] 正在转换 checkpoint 到 TensorRT 权重格式...")
         convert_script = os.path.join(
             os.path.dirname(__file__),
             "runtime/triton_trtllm/scripts/convert_checkpoint.py"
         )
         
-        if not os.path.exists(convert_script):
-            raise FileNotFoundError(f"转换脚本不存在: {convert_script}")
-        
-        convert_cmd = [
-            sys.executable,  # 使用当前 Python 解释器
-            convert_script,
-            "--model_dir", model_dir,
-            "--output_dir", weights_dir,
-            "--dtype", dtype
-        ]
-        
-        logging.info(f"执行命令: {' '.join(convert_cmd)}")
-        result = subprocess.run(
-            convert_cmd,
-            check=True,
-            capture_output=True,
-            text=True
-        )
-        logging.info(f"✅ Checkpoint 转换成功")
-        if result.stdout:
-            logging.debug(result.stdout)
+        # 如果权重目录为空，则执行转换；如果已有权重文件则跳过
+        if not (os.path.isdir(weights_dir) and os.listdir(weights_dir)):
+            if not os.path.exists(convert_script):
+                raise FileNotFoundError(f"转换脚本不存在: {convert_script}")
+            
+            convert_cmd = [
+                sys.executable,  # 使用当前 Python 解释器
+                convert_script,
+                "--model_dir", model_dir,
+                "--output_dir", weights_dir,
+                "--dtype", dtype
+            ]
+            
+            logging.info("[1/2] 正在转换 checkpoint 到 TensorRT 权重格式...")
+            logging.info(f"执行命令: {' '.join(convert_cmd)}")
+            result = subprocess.run(
+                convert_cmd,
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            logging.info(f"✅ Checkpoint 转换成功")
+            if result.stdout:
+                logging.debug(result.stdout)
+        else:
+            logging.info(f"[1/2] 检测到已有 TensorRT 权重目录 {weights_dir}，跳过 checkpoint 转换")
         
         # 阶段 2: 编译 TensorRT 引擎
         logging.info("[2/2] 正在编译 TensorRT 引擎（这可能需要几分钟）...")
@@ -632,15 +636,11 @@ class FastCosyVoice2:
             model = self.cosyvoice.model
             model.hift_cache_dict[this_uuid] = None
             
-            # 核心参数：越小首包延迟越低，但是容易追尾和影响音质
-            # 直观类比：
-            # token_hop_len：火车每站前进 16 公里
-            # token_hop_len_first：第一站因为要出站+对齐，所以先走 8 公里 + 对齐距离
-            # pre_lookahead_len：司机总要多往前看 3 公里
-            token_hop_len = 16  # 标准 hop 长度，太低容易追尾（默认25）
-            token_hop_len_first = 6 # 首块 tokens ，代表要等 LLM 累积多少个 token 才能开始第一块 token2wav（默认12）
+            # 核心参数：保持原始对齐逻辑不变
+            token_hop_len = 16  # 标准 hop 长度（保持原始设置）
+            token_hop_len_first = 6  # 首块使用更小的 hop，减少等待
             pre_lookahead_len = model.flow.pre_lookahead_len  # 前瞻长度 (3)
-    
+            
             # 关键：prompt_token_pad 必须基于标准 hop_len 计算，不能改变
             prompt_token_pad = int(np.ceil(flow_prompt_speech_token.shape[1] / token_hop_len) * token_hop_len - flow_prompt_speech_token.shape[1])
             
