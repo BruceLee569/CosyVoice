@@ -101,7 +101,8 @@ class MaskedDiffWithXvec(torch.nn.Module):
         )
         return {'loss': loss}
 
-    @torch.inference_mode()
+    # @torch.inference_mode()
+    @torch.no_grad()
     def inference(self,
                   token,
                   token_len,
@@ -232,7 +233,7 @@ class CausalMaskedDiffWithXvec(torch.nn.Module):
         )
         return {'loss': loss}
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def inference(self,
                   token,
                   token_len,
