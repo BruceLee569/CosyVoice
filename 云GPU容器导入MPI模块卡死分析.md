@@ -172,18 +172,31 @@ option(ENABLE_MULTI_DEVICE "Enable multi-device support" OFF)
 
 3. **编译**：
 ```bash
-# 通过编译参数 ENABLE_MULTI_DEVICE=0 禁用多设备支持，避免受限环境下的云容器实例导入mpi模块时卡死
-# 官方whl包默认开启，会导致在Autodl和GPUGEEK租的GPU容器内import tensorrt_llm时阻塞
-# 在本地WSL2完整的容器环境内是可以跑起来官方的whl包的
+# 加快二次编译速度
+apt-get install ccache
+# 指定GPU架构，注意不支持20系图灵架构硬件（https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html）
 nohup python3 ./scripts/build_wheel.py \
     --cuda_architectures "80;86;89;120" \
     # 一个job的内存峰值占用需要大约6G内存（请注意内存容量避免中途OOM）
     --job_count 2 \
-	--trt_root /usr \
+    --trt_root /usr \
     --use_ccache \
-    --extra-cmake-vars "ENABLE_MULTI_DEVICE=0" > build.log 2>&1 &
+    # 通过编译参数 ENABLE_MULTI_DEVICE=0 禁用多设备支持，避免受限环境下的云容器实例导入mpi模块时卡死
+    # 官方whl包默认开启，会导致在Autodl和GPUGEEK租的GPU容器内import tensorrt_llm时阻塞
+    # 在本地WSL2完整的容器环境内是可以跑起来官方的whl包的
+    --extra-cmake-vars "ENABLE_MULTI_DEVICE=0" \
+    --configure_cmake \
+    > build.log 2>&1 &
 
+# 查看编译日志
 tail -f build.log
+
+# 编译完成后查看so文件信息，确认支持的显卡架构
+cuobjdump build/lib.linux-x86_64-cpython-310/tensorrt_llm/libs/libnvinfer_plugin_tensorrt_llm.so | grep sm_
+```
+
+```bash
+# 修改 tensorrt_llm/_utils.py 源码
 ```
 
 4. **安装**：
