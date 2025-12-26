@@ -48,7 +48,8 @@ compile_commands.json
 # *.pt
 
 pretrained_models/*
-!pretrained_models/.gitkeep
+!pretrained_models/
+
 test_output/*
 *_pb2_grpc.py
 *_pb2.py
