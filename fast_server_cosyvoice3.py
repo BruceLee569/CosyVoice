@@ -1,0 +1,1044 @@
+import os
+import time
+import sys
+import argparse
+import logging
+import re
+import glob
+import json
+from functools import partial
+import inflect
+
+# 配置日志格式，确保显示毫秒级时间戳
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s.%(msecs)03d %(levelname)s %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logging.getLogger("matplotlib").setLevel(logging.WARNING)
+
+from fastapi import FastAPI, Form, Request
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.base import BaseHTTPMiddleware
+import uvicorn
+import numpy as np
+import torch
+
+# 添加 Matcha-TTS 路径
+sys.path.append("third_party/Matcha-TTS")
+
+# TensorRT-LLM 相关
+try:
+    import tensorrt_llm
+    from tensorrt_llm.runtime import ModelRunnerCpp
+    from transformers import AutoTokenizer
+    TRTLLM_AVAILABLE = True
+except ImportError as e:
+    TRTLLM_AVAILABLE = False
+    logging.warning(f"TensorRT-LLM 不可用: {e}. 将使用原始 PyTorch 推理")
+
+# subprocess 用于执行 TensorRT-LLM 编译命令
+import subprocess
+
+from cosyvoice.cli.cosyvoice import CosyVoice3
+from cosyvoice.utils.file_utils import load_wav
+from cosyvoice.utils.frontend_utils import (
+    contains_chinese,
+    replace_blank,
+    replace_corner_mark,
+    remove_bracket,
+    spell_out_number,
+    split_paragraph,
+    is_only_punctuation,
+)
+import uuid as uuid_module
+
+# 导入 ttsfrd 模块（用于文本规范化）
+try:
+    import ttsfrd
+    USE_TTSFRD = True
+    logging.info("已导入 ttsfrd 模块用于文本规范化")
+except ImportError:
+    USE_TTSFRD = False
+    logging.warning("ttsfrd 不可用，将使用 wetext 进行文本规范化")
+    try:
+        from wetext import Normalizer as ZhNormalizer
+        from wetext import Normalizer as EnNormalizer
+    except ImportError:
+        logging.warning("wetext 也不可用，文本规范化功能将受限")
+
+app = FastAPI()
+
+
+class TimingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request.state.start_time = time.perf_counter()
+        response = await call_next(request)
+        return response
+
+
+app.add_middleware(TimingMiddleware)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 挂载静态文件目录
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if os.path.exists(static_dir):
+    app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+# Chat template for TensorRT-LLM (CosyVoice3)
+TRTLLM_CHAT_TEMPLATE = (
+    "{%- for message in messages %}"
+    "{%- if message['role'] == 'user' %}"
+    "{{- '<|sos|>' + message['content'] + '<|task_id|>' }}"
+    "{%- elif message['role'] == 'assistant' %}"
+    "{{- message['content']}}"
+    "{%- endif %}"
+    "{%- endfor %}"
+)
+
+
+def build_trtllm_engine(model_dir, tokenizer_dir, engine_dir, dtype="bfloat16"):
+    """自动编译 TensorRT-LLM 引擎"""
+    logging.info("=" * 70)
+    logging.info("检测到 TensorRT-LLM 引擎不存在，开始自动编译...")
+    logging.info(f"  模型目录: {model_dir}")
+    logging.info(f"  引擎输出: {engine_dir}")
+    logging.info(f"  数据类型: {dtype}")
+    logging.info("=" * 70)
+
+    weights_dir = os.path.join(os.path.dirname(engine_dir), f"trt_weights_{dtype}")
+    os.makedirs(weights_dir, exist_ok=True)
+    os.makedirs(engine_dir, exist_ok=True)
+
+    try:
+        convert_script = os.path.join(
+            os.path.dirname(__file__),
+            "runtime/triton_trtllm/scripts/convert_checkpoint.py",
+        )
+        if not (os.path.isdir(weights_dir) and os.listdir(weights_dir)):
+            if not os.path.exists(convert_script):
+                raise FileNotFoundError(f"转换脚本不存在: {convert_script}")
+
+            convert_cmd = [
+                sys.executable,
+                convert_script,
+                "--model_dir",
+                model_dir,
+                "--output_dir",
+                weights_dir,
+                "--dtype",
+                dtype,
+            ]
+            logging.info("[1/2] 正在转换 checkpoint 到 TensorRT 权重格式...")
+            logging.info(f"执行命令: {' '.join(convert_cmd)}")
+            result = subprocess.run(
+                convert_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            logging.info("✅ Checkpoint 转换成功")
+            if result.stdout:
+                logging.debug(result.stdout)
+        else:
+            logging.info(
+                f"[1/2] 检测到已有 TensorRT 权重目录 {weights_dir}，跳过 checkpoint 转换"
+            )
+
+        logging.info("[2/2] 正在编译 TensorRT 引擎（这可能需要几分钟）...")
+        build_cmd = [
+            "trtllm-build",
+            "--checkpoint_dir",
+            weights_dir,
+            "--output_dir",
+            engine_dir,
+            "--max_batch_size",
+            "16",
+            "--max_num_tokens",
+            "32768",
+            "--gemm_plugin",
+            dtype,
+        ]
+        logging.info(f"执行命令: {' '.join(build_cmd)}")
+        result = subprocess.run(
+            build_cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logging.info("✅ TensorRT 引擎编译成功")
+        if result.stdout:
+            logging.debug(result.stdout)
+
+        logging.info("=" * 70)
+        logging.info(f"🎉 TensorRT-LLM 引擎编译完成: {engine_dir}")
+        logging.info("=" * 70)
+
+    except subprocess.CalledProcessError as e:
+        logging.error(f"❌ TensorRT-LLM 引擎编译失败: {e}")
+        logging.error(f"stdout: {e.stdout}")
+        logging.error(f"stderr: {e.stderr}")
+        raise RuntimeError(f"TensorRT-LLM 引擎编译失败: {e.stderr}")
+    except Exception as e:
+        logging.error(f"❌ TensorRT-LLM 引擎编译过程出错: {e}")
+        raise
+
+
+class TextNormalizer:
+    """文本规范化工具类，复用 CosyVoice frontend 的成熟实现"""
+
+    def __init__(self, tokenizer, use_ttsfrd=True):
+        self.tokenizer = tokenizer
+        self.use_ttsfrd = use_ttsfrd
+        if self.use_ttsfrd:
+            self.frd = ttsfrd.TtsFrontendEngine()
+            resource_dir = os.path.join(
+                os.path.dirname(__file__), "pretrained_models/CosyVoice-ttsfrd/resource"
+            )
+            if os.path.exists(resource_dir):
+                if not self.frd.initialize(resource_dir):
+                    logging.warning("ttsfrd 初始化失败，将使用 wetext")
+                    self.use_ttsfrd = False
+                    self._init_wetext()
+                else:
+                    self.frd.set_lang_type("pinyinvg")
+                    logging.info("✅ ttsfrd 初始化成功")
+            else:
+                logging.warning(
+                    f"ttsfrd 资源目录不存在: {resource_dir}，将使用 wetext"
+                )
+                self.use_ttsfrd = False
+                self._init_wetext()
+        else:
+            self._init_wetext()
+
+    def _init_wetext(self):
+        if "ZhNormalizer" in globals():
+            self.zh_tn_model = ZhNormalizer(remove_erhua=False)
+            self.en_tn_model = EnNormalizer()
+            self.inflect_parser = inflect.engine()
+            logging.info("使用 wetext 作为文本规范化工具")
+        else:
+            logging.warning("wetext 不可用，将跳过文本规范化")
+
+    def normalize_and_split(self, text, token_max_n=80, token_min_n=60):
+        if not text or text.strip() == "":
+            return []
+        text = text.strip()
+        if self.use_ttsfrd:
+            try:
+                result = self.frd.do_voicegen_frd(text)
+                texts = [i["text"] for i in json.loads(result)["sentences"]]
+                text = "".join(texts)
+            except Exception as e:
+                logging.warning(f"ttsfrd 处理失败: {e}，使用原始文本")
+        else:
+            if "zh_tn_model" in dir(self):
+                if contains_chinese(text):
+                    text = self.zh_tn_model.normalize(text)
+                    text = text.replace("\n", "")
+                    text = replace_blank(text)
+                    text = replace_corner_mark(text)
+                    text = text.replace(".", "。")
+                    text = text.replace(" - ", "，")
+                    text = remove_bracket(text)
+                    text = re.sub(r"[，,、]+$", "。", text)
+                else:
+                    text = self.en_tn_model.normalize(text)
+                    text = spell_out_number(text, self.inflect_parser)
+
+        tokenize_fn = partial(self.tokenizer.encode, allowed_special="all")
+        if contains_chinese(text):
+            texts = list(
+                split_paragraph(
+                    text,
+                    tokenize_fn,
+                    "zh",
+                    token_max_n=token_max_n,
+                    token_min_n=token_min_n,
+                    merge_len=20,
+                    comma_split=False,
+                )
+            )
+        else:
+            texts = list(
+                split_paragraph(
+                    text,
+                    tokenize_fn,
+                    "en",
+                    token_max_n=token_max_n,
+                    token_min_n=token_min_n,
+                    merge_len=20,
+                    comma_split=False,
+                )
+            )
+        texts = [i for i in texts if not is_only_punctuation(i)]
+        if texts:
+            logging.info(
+                f"[文本规范化] 原始长度: {len(text)} 字符 → 分成 {len(texts)} 段"
+            )
+            for idx, seg in enumerate(texts):
+                logging.info(
+                    f"  段{idx+1}: {len(seg)}字符 - '"
+                    f"{seg[:30]}{'...' if len(seg) > 30 else ''}'"
+                )
+        return texts
+
+
+def convert_speech_tokens_to_str(speech_tokens):
+    if isinstance(speech_tokens, torch.Tensor):
+        speech_tokens = speech_tokens.flatten().tolist()
+    return "".join([f"<|s_{token}|>" for token in speech_tokens])
+
+
+def extract_speech_ids_from_str(speech_tokens_str_list):
+    speech_ids = []
+    for token_str in speech_tokens_str_list:
+        if token_str.startswith("<|s_") and token_str.endswith("|>"):
+            try:
+                num_str = token_str[4:-2]
+                num = int(num_str)
+                speech_ids.append(num)
+            except ValueError:
+                logging.warning(f"无法解析 speech token: {token_str}")
+    return speech_ids
+
+
+class FastCosyVoice3:
+    """集成 TensorRT-LLM 的 CosyVoice3 推理类"""
+
+    def __init__(self, cosyvoice_model, trtllm_engine_dir, trtllm_tokenizer_dir, spk2info_path=None):
+        self.cosyvoice: CosyVoice3 = cosyvoice_model
+        self.trtllm_runner = None
+        self.trtllm_tokenizer = None
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.spk2info_path = spk2info_path
+        self.spk_prompt_text_raw = {}
+        self.text_normalizer = None
+        self._init_trtllm(trtllm_engine_dir, trtllm_tokenizer_dir)
+        logging.info("✅ TensorRT-LLM 初始化成功")
+        self.text_normalizer = TextNormalizer(
+            tokenizer=self.trtllm_tokenizer, use_ttsfrd=USE_TTSFRD
+        )
+
+    def _init_trtllm(self, engine_dir, tokenizer_dir):
+        if not os.path.exists(engine_dir):
+            logging.warning(f"TensorRT-LLM 引擎目录不存在: {engine_dir}")
+            model_dir = tokenizer_dir
+            dtype = "bfloat16"
+            if "bfloat16" in engine_dir:
+                dtype = "bfloat16"
+            elif "float16" in engine_dir:
+                dtype = "float16"
+            elif "float32" in engine_dir:
+                dtype = "float32"
+            logging.info(f"将自动编译 TensorRT-LLM 引擎（dtype={dtype}）")
+            build_trtllm_engine(
+                model_dir=model_dir,
+                tokenizer_dir=tokenizer_dir,
+                engine_dir=engine_dir,
+                dtype=dtype,
+            )
+
+        runtime_rank = tensorrt_llm.mpi_rank()
+        self.trtllm_tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+        if "system" in self.trtllm_tokenizer.chat_template:
+            self.trtllm_tokenizer.chat_template = TRTLLM_CHAT_TEMPLATE
+            logging.info("已设置 CosyVoice3 专用 chat template")
+
+        self.eos_token_id = self.trtllm_tokenizer.convert_tokens_to_ids("<|eos1|>")
+        runner_kwargs = dict(
+            engine_dir=engine_dir,
+            rank=runtime_rank,
+            max_output_len=1024,
+            enable_context_fmha_fp32_acc=False,
+            max_batch_size=1,
+            max_input_len=1024,
+            kv_cache_free_gpu_memory_fraction=0.25,
+            cuda_graph_mode=False,
+            gather_generation_logits=False,
+        )
+        self.trtllm_runner = ModelRunnerCpp.from_dir(**runner_kwargs)
+        logging.info(f"TensorRT-LLM 引擎已加载: {engine_dir}")
+
+    def _prepare_llm_input(self, tts_text, prompt_text, prompt_speech_tokens):
+        """构建 TensorRT-LLM 输入序列
+        
+        根据 CosyVoice3LM.inference 的输入格式:
+        lm_input = [sos_emb] + [text_emb] + [task_id_emb] + [prompt_speech_token_emb]
+        
+        对应 TensorRT-LLM 的 token 序列:
+        <|sos|> + full_text + <|task_id|> + prompt_speech_tokens
+        
+        其中 full_text = prompt_text + tts_text
+        
+        注意: 原始 CosyVoice3 模型中，spk2info['prompt_text'] 不包含系统前缀
+        "You are a helpful assistant.<|endofprompt|>"，所以这里也不添加。
+        """
+        # 构建完整的提示文本（不添加系统前缀，与原始模型保持一致）
+        full_text = prompt_text + tts_text
+        
+        # 构建 prompt_speech_tokens 字符串
+        prompt_speech_str = convert_speech_tokens_to_str(prompt_speech_tokens)
+        
+        # 直接构建输入序列: <|sos|>full_text<|task_id|>speech_tokens
+        input_str = f"<|sos|>{full_text}<|task_id|>{prompt_speech_str}"
+        
+        # 编码为 token IDs
+        input_ids = self.trtllm_tokenizer.encode(
+            input_str,
+            add_special_tokens=False,
+            return_tensors="pt"
+        )
+        
+        return input_ids
+
+    def _trtllm_generate_streaming(self, input_ids, debug=False):
+        try:
+            input_length = input_ids.shape[1]
+            if debug:
+                logging.info(f"[DEBUG] TRT-LLM 输入长度: {input_length}")
+                logging.info(f"[DEBUG] 输入 token IDs 前10个: {input_ids[0][:10].tolist()}")
+                logging.info(f"[DEBUG] 输入 token IDs 后10个: {input_ids[0][-10:].tolist()}")
+            
+            outputs_iter = self.trtllm_runner.generate(
+                batch_input_ids=[input_ids[0]],
+                max_new_tokens=1024,
+                end_id=self.eos_token_id,
+                pad_id=self.eos_token_id,
+                temperature=1.0,  # 不使用温度采样
+                top_k=25,  # 与原始代码一致
+                top_p=1.0,  # 禁用 nucleus sampling
+                streaming=True,
+                output_sequence_lengths=True,
+                return_dict=True,
+            )
+            first_output = True
+            for outputs in outputs_iter:
+                torch.cuda.synchronize()
+                output_ids = outputs["output_ids"]
+                sequence_lengths = outputs["sequence_lengths"]
+                actual_length = sequence_lengths[0][0].item()
+                generated_ids = output_ids[0][0][input_length:actual_length].tolist()
+                generated_tokens_str = self.trtllm_tokenizer.batch_decode(
+                    [[tid] for tid in generated_ids], skip_special_tokens=False
+                )
+                
+                if debug and first_output:
+                    logging.info(f"[DEBUG] 首次生成 token 数量: {len(generated_ids)}")
+                    logging.info(f"[DEBUG] 首次生成 token IDs 前20个: {generated_ids[:20]}")
+                    logging.info(f"[DEBUG] 首次生成 token 字符串前20个: {generated_tokens_str[:20]}")
+                    # 检查是否有非 speech token
+                    non_speech_tokens = [t for t in generated_tokens_str if not (t.startswith('<|s_') and t.endswith('|>'))]
+                    if non_speech_tokens:
+                        logging.warning(f"[DEBUG] 检测到非 speech token: {non_speech_tokens[:10]}")
+                    first_output = False
+                
+                speech_ids = extract_speech_ids_from_str(generated_tokens_str)
+                is_final = outputs.get("finished", False)
+                if isinstance(is_final, torch.Tensor):
+                    is_final = is_final.item()
+                yield speech_ids, is_final
+                if is_final:
+                    break
+        except Exception as e:
+            logging.error(f"TensorRT-LLM 流式生成失败: {e}")
+            raise
+
+    def _trtllm_generate(self, input_ids):
+        try:
+            input_length = input_ids.shape[1]
+            outputs = self.trtllm_runner.generate(
+                batch_input_ids=[input_ids[0]],
+                max_new_tokens=1024,
+                end_id=self.eos_token_id,
+                pad_id=self.eos_token_id,
+                temperature=1.0,  # 不使用温度采样
+                top_k=25,  # 与原始代码一致
+                top_p=1.0,  # 禁用 nucleus sampling
+                streaming=False,
+                output_sequence_lengths=True,
+                return_dict=True,
+            )
+            torch.cuda.synchronize()
+            output_ids = outputs["output_ids"]
+            sequence_lengths = outputs["sequence_lengths"]
+            actual_length = sequence_lengths[0][0].item()
+            generated_ids = output_ids[0][0][input_length:actual_length].tolist()
+            generated_tokens_str = self.trtllm_tokenizer.batch_decode(
+                [[tid] for tid in generated_ids], skip_special_tokens=False
+            )
+            speech_ids = extract_speech_ids_from_str(generated_tokens_str)
+            logging.info(f"TensorRT-LLM 生成了 {len(speech_ids)} 个 speech tokens")
+            return speech_ids
+        except Exception as e:
+            logging.error(f"TensorRT-LLM 生成失败: {e}")
+            raise
+
+    def inference_zero_shot(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id="", stream=True, request_start_time=None):
+        if request_start_time is None:
+            request_start_time = time.perf_counter()
+        text_segments = self.text_normalizer.normalize_and_split(
+            text, token_max_n=80, token_min_n=60
+        )
+        if len(text_segments) == 0:
+            logging.warning("[文本分段] 输入文本为空，跳过推理")
+            return
+        logging.info(
+            f"[长文本处理] 原始文本 {len(text)} 字符 → 分成 {len(text_segments)} 段进行流式推理"
+        )
+        for segment_idx, text_segment in enumerate(text_segments):
+            segment_start_time = time.perf_counter()
+            logging.info(
+                f"[段落推理 {segment_idx+1}/{len(text_segments)}] 开始处理: '"
+                f"{text_segment[:50]}{'...' if len(text_segment) > 50 else ''}'"
+            )
+            for output in self._inference_single_segment(
+                text_segment,
+                prompt_text,
+                prompt_speech_16k,
+                zero_shot_spk_id=zero_shot_spk_id,
+                stream=stream,
+                request_start_time=request_start_time if segment_idx == 0 else segment_start_time,
+                is_first_segment=(segment_idx == 0),
+            ):
+                yield output
+            segment_time = (time.perf_counter() - segment_start_time) * 1000
+            logging.info(
+                f"[段落推理 {segment_idx+1}/{len(text_segments)}] 完成，耗时: {segment_time:.2f}ms"
+            )
+
+    def _inference_single_segment(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id="", stream=True, request_start_time=None, is_first_segment=True):
+        try:
+            context_start = time.perf_counter()
+            spk_info = self.cosyvoice.frontend.spk2info.get(zero_shot_spk_id)
+            if spk_info is None:
+                raise ValueError(f"Speaker {zero_shot_spk_id} 不存在")
+            prompt_text_raw = self.spk_prompt_text_raw.get(zero_shot_spk_id, "")
+            if not prompt_text_raw:
+                logging.warning(
+                    f"Speaker {zero_shot_spk_id} 缺少原始 prompt_text，无法使用 TensorRT-LLM"
+                )
+                raise ValueError("缺少原始 prompt_text")
+            llm_prompt_speech_token = spk_info["llm_prompt_speech_token"]
+            flow_prompt_speech_token = spk_info["flow_prompt_speech_token"]
+            prompt_speech_feat = spk_info["prompt_speech_feat"]
+            flow_embedding = spk_info["flow_embedding"]
+            context_load_time = (time.perf_counter() - context_start) * 1000
+            if is_first_segment:
+                logging.info(
+                    f"[延迟分析-01] 上下文加载: {context_load_time:.2f}ms (spk_info检索+数据解析)"
+                )
+
+            prepare_start = time.perf_counter()
+            input_ids = self._prepare_llm_input(text, prompt_text_raw, llm_prompt_speech_token)
+            prepare_time = (time.perf_counter() - prepare_start) * 1000
+            if is_first_segment:
+                logging.info(
+                    f"[延迟分析-02] LLM输入准备: {prepare_time:.2f}ms "
+                    f"(text:{len(text)} chars, prompt:{len(prompt_text_raw)} chars, input_tokens:{input_ids.shape[1]})"
+                )
+
+            init_start = time.perf_counter()
+            this_uuid = str(uuid_module.uuid1())
+            model = self.cosyvoice.model
+            model.hift_cache_dict[this_uuid] = None
+            token_hop_len = getattr(model, "token_hop_len", 25)
+            token_hop_len_first = max(5, token_hop_len // 3)
+            pre_lookahead_len = model.flow.pre_lookahead_len
+            prompt_token_pad = int(
+                np.ceil(flow_prompt_speech_token.shape[1] / token_hop_len) * token_hop_len
+                - flow_prompt_speech_token.shape[1]
+            )
+            token_offset = 0
+            chunk_idx = 0
+            total_audio_duration = 0.0
+            total_processing_time = 0.0
+            sample_rate = self.cosyvoice.sample_rate
+            init_time = (time.perf_counter() - init_start) * 1000
+            first_chunk_tokens_needed = token_hop_len_first + prompt_token_pad + pre_lookahead_len
+            if is_first_segment:
+                logging.info(
+                    f"[延迟分析-03] 推理参数初始化: {init_time:.2f}ms "
+                    f"(hop_first={token_hop_len_first}, hop_normal={token_hop_len}, "
+                    f"prompt_pad={prompt_token_pad}, lookahead={pre_lookahead_len}, "
+                    f"first_needed={first_chunk_tokens_needed})"
+                )
+                logging.info(
+                    f"[流式生成] 开始流式生成+token2wav: first_chunk_needed={first_chunk_tokens_needed} tokens"
+                )
+
+            token_gen_start = time.perf_counter()
+            first_token_gen_time = None
+            speech_tokens = []
+            generation_done = False
+            first_chunk_generated = False
+
+            for current_tokens, is_final in self._trtllm_generate_streaming(input_ids, debug=is_first_segment):
+                if first_token_gen_time is None:
+                    first_token_gen_time = (time.perf_counter() - token_gen_start) * 1000
+                    if is_first_segment:
+                        logging.info(
+                            f"[延迟分析-04a] 首个Token生成完毕: {first_token_gen_time:.2f}ms "
+                            f"(首包tokens: {len(current_tokens)})"
+                        )
+                speech_tokens = current_tokens
+                generation_done = is_final
+
+                while True:
+                    if token_offset == 0:
+                        this_token_hop_len = token_hop_len_first + prompt_token_pad
+                    else:
+                        this_token_hop_len = token_hop_len
+                    tokens_needed = token_offset + this_token_hop_len + pre_lookahead_len
+                    if tokens_needed <= len(speech_tokens):
+                        if not first_chunk_generated:
+                            first_chunk_start = time.perf_counter()
+                            accumulated_tokens_time = (
+                                first_chunk_start - token_gen_start
+                            ) * 1000
+                            if is_first_segment:
+                                logging.info(
+                                    f"[延迟分析-04b] Token累积到首块需量: {accumulated_tokens_time:.2f}ms "
+                                    f"(已累积tokens: {len(speech_tokens)}/{tokens_needed})"
+                                )
+                        chunk_start_time = time.perf_counter()
+                        this_tts_speech_token = torch.tensor(
+                            speech_tokens[:tokens_needed]
+                        ).unsqueeze(0)
+                        tts_speech = model.token2wav(
+                            token=this_tts_speech_token,
+                            prompt_token=flow_prompt_speech_token,
+                            prompt_feat=prompt_speech_feat,
+                            embedding=flow_embedding,
+                            token_offset=token_offset,
+                            uuid=this_uuid,
+                            stream=True,
+                            finalize=False,
+                            speed=1.0,
+                        )
+                        chunk_time = (time.perf_counter() - chunk_start_time) * 1000
+                        chunk_audio_duration = tts_speech.shape[-1] / sample_rate
+                        chunk_rtf = (
+                            (chunk_time / 1000) / chunk_audio_duration
+                            if chunk_audio_duration > 0
+                            else 0
+                        )
+                        total_audio_duration += chunk_audio_duration
+                        total_processing_time += chunk_time / 1000
+                        cumulative_rtf = (
+                            total_processing_time / total_audio_duration
+                            if total_audio_duration > 0
+                            else 0
+                        )
+                        if not first_chunk_generated:
+                            if is_first_segment:
+                                logging.info(
+                                    f"[延迟分析-05] 首块音频合成(token2wav): {chunk_time:.2f}ms "
+                                    f"(tokens: {tokens_needed}, hop: {this_token_hop_len})"
+                                )
+                                logging.info(
+                                    f"[首块RTF] 音频时长: {chunk_audio_duration*1000:.1f}ms, "
+                                    f"处理耗时: {chunk_time:.1f}ms, RTF: {chunk_rtf:.3f}"
+                                )
+                            first_chunk_generated = True
+                            if is_first_segment:
+                                total_ttfb = (
+                                    time.perf_counter() - request_start_time
+                                ) * 1000
+                                logging.info("\n" + "=" * 70)
+                                logging.info(
+                                    f"[首包延迟汇总 TTFB] 总耗时: {total_ttfb:.2f}ms"
+                                )
+                                logging.info(
+                                    f"  ├─ 上下文加载: {context_load_time:.2f}ms (step 1)"
+                                )
+                                logging.info(
+                                    f"  ├─ LLM输入准备: {prepare_time:.2f}ms (step 2)"
+                                )
+                                logging.info(
+                                    f"  ├─ 参数初始化: {init_time:.2f}ms (step 3)"
+                                )
+                                logging.info(
+                                    f"  ├─ Token生成(首个): {first_token_gen_time:.2f}ms (step 4a)"
+                                )
+                                logging.info(
+                                    f"  ├─ Token累积等待: {accumulated_tokens_time - first_token_gen_time:.2f}ms (step 4b)"
+                                )
+                                logging.info(
+                                    f"  └─ 音频合成(token2wav): {chunk_time:.2f}ms (step 5)"
+                                )
+                                logging.info(
+                                    f"[延迟分解] Model:{context_load_time+prepare_time+init_time:.1f}ms + "
+                                    f"LLMGen:{first_token_gen_time:.1f}ms + TTW:{chunk_time:.1f}ms + "
+                                    f"Wait:{accumulated_tokens_time - first_token_gen_time:.1f}ms = {total_ttfb:.1f}ms"
+                                )
+                                logging.info(
+                                    f"[性能指标] 首块RTF: {chunk_rtf:.3f}, 音频: {chunk_audio_duration*1000:.0f}ms, 目标RTF: <0.2"
+                                )
+                                logging.info("=" * 70 + "\n")
+                        else:
+                            logging.info(
+                                f"[流式token2wav] 块{chunk_idx}: 音频={chunk_audio_duration*1000:.0f}ms, "
+                                f"耗时={chunk_time:.1f}ms, RTF={chunk_rtf:.3f}, 累积RTF={cumulative_rtf:.3f}"
+                            )
+                        token_offset += this_token_hop_len
+                        chunk_idx += 1
+                        yield {"tts_speech": tts_speech.cpu()}
+                    else:
+                        break
+                if generation_done:
+                    break
+
+            if token_offset < len(speech_tokens):
+                chunk_start_time = time.perf_counter()
+                this_tts_speech_token = torch.tensor(speech_tokens).unsqueeze(0)
+                tts_speech = model.token2wav(
+                    token=this_tts_speech_token,
+                    prompt_token=flow_prompt_speech_token,
+                    prompt_feat=prompt_speech_feat,
+                    embedding=flow_embedding,
+                    token_offset=token_offset,
+                    uuid=this_uuid,
+                    stream=True,
+                    finalize=True,
+                    speed=1.0,
+                )
+                chunk_time = (time.perf_counter() - chunk_start_time) * 1000
+                chunk_audio_duration = tts_speech.shape[-1] / sample_rate
+                chunk_rtf = (
+                    (chunk_time / 1000) / chunk_audio_duration
+                    if chunk_audio_duration > 0
+                    else 0
+                )
+                total_audio_duration += chunk_audio_duration
+                total_processing_time += chunk_time / 1000
+                cumulative_rtf = (
+                    total_processing_time / total_audio_duration
+                    if total_audio_duration > 0
+                    else 0
+                )
+                logging.info(
+                    f"[流式token2wav] 最终块{chunk_idx}: 音频={chunk_audio_duration*1000:.0f}ms, "
+                    f"耗时={chunk_time:.1f}ms, RTF={chunk_rtf:.3f} (finalize)"
+                )
+                yield {"tts_speech": tts_speech.cpu()}
+
+            overall_rtf = (
+                total_processing_time / total_audio_duration
+                if total_audio_duration > 0
+                else 0
+            )
+            if is_first_segment:
+                logging.info(
+                    f"[FastTTS] 流式生成完成: 共 {len(speech_tokens)} 个 speech tokens, {chunk_idx + 1} 个音频块"
+                )
+                logging.info(
+                    f"[整体RTF统计] 总音频时长: {total_audio_duration:.2f}s, 总处理时间: {total_processing_time:.2f}s, 整体RTF: {overall_rtf:.3f} (目标: <0.2)"
+                )
+            if this_uuid in model.hift_cache_dict:
+                model.hift_cache_dict.pop(this_uuid)
+        except Exception as e:
+            logging.error(f"TensorRT-LLM 推理失败: {e}")
+            import traceback
+
+            traceback.print_exc()
+            raise
+
+    def list_available_spks(self):
+        return self.cosyvoice.list_available_spks()
+
+    def add_zero_shot_spk(self, prompt_text, prompt_speech_16k, zero_shot_spk_id):
+        self.spk_prompt_text_raw[zero_shot_spk_id] = prompt_text
+        return self.cosyvoice.add_zero_shot_spk(
+            prompt_text, prompt_speech_16k, zero_shot_spk_id
+        )
+
+    def save_spkinfo(self):
+        if self.spk2info_path:
+            torch.save(self.cosyvoice.frontend.spk2info, self.spk2info_path)
+            logging.info(f"说话人信息已保存到: {self.spk2info_path}")
+        else:
+            return self.cosyvoice.save_spkinfo()
+
+    def load_spk_prompt_text_raw(self, spk_prompt_text_raw_dict):
+        self.spk_prompt_text_raw.update(spk_prompt_text_raw_dict)
+
+
+def generate_data(model_output, request_start_time):
+    is_first = True
+    chunk_count = 0
+    for i in model_output:
+        if is_first:
+            first_chunk_time = time.perf_counter()
+            ttfb = (first_chunk_time - request_start_time) * 1000
+            logging.info(
+                f"[TTS统计] HTTP响应首包生成完毕! HTTP TTFB: {ttfb:.2f}ms"
+            )
+            is_first = False
+        tts_speech = i["tts_speech"].numpy()
+        tts_speech = np.clip(tts_speech, -1.0, 1.0)
+        tts_audio = (tts_speech * 32767.0).astype(np.int16).tobytes()
+        chunk_count += 1
+        yield tts_audio
+    total_time = (time.perf_counter() - request_start_time) * 1000
+    logging.info(
+        f"[TTS统计] 流式传输结束. 总耗时: {total_time:.2f}ms, 共发送 {chunk_count} 个数据块"
+    )
+
+
+def load_speakers_from_directory(speaker_dir="asset/speakers"):
+    speakers = {}
+    if not os.path.exists(speaker_dir):
+        logging.warning(f"说话人目录 {speaker_dir} 不存在")
+        return speakers
+    wav_files = glob.glob(os.path.join(speaker_dir, "*.wav"))
+    for wav_path in wav_files:
+        filename = os.path.basename(wav_path)
+        match = re.match(r"\[(.+?)\](.+)\.wav$", filename)
+        if match:
+            speaker_name = match.group(1)
+            prompt_text = match.group(2)
+            try:
+                prompt_speech_16k = load_wav(wav_path, 16000)
+                max_val = torch.abs(prompt_speech_16k).max().item()
+                target_peak = 0.95
+                if max_val > target_peak:
+                    logging.warning(
+                        f"说话人 {speaker_name} 音频峰值 {max_val:.4f} 超出安全范围，归一化到 {target_peak}"
+                    )
+                    prompt_speech_16k = (prompt_speech_16k / max_val) * target_peak
+                speakers[speaker_name] = {
+                    "prompt_text": prompt_text,
+                    "prompt_speech_16k": prompt_speech_16k,
+                    "wav_path": wav_path,
+                }
+                logging.info(f"加载说话人: {speaker_name}")
+            except Exception as e:
+                logging.error(f"加载说话人 {speaker_name} 失败: {e}")
+        else:
+            logging.warning(f"文件名格式不正确，跳过: {filename}")
+    return speakers
+
+
+def extract_spk_prompt_text_from_directory(speaker_dir="asset/speakers"):
+    spk_prompt_text_raw = {}
+    if not os.path.exists(speaker_dir):
+        logging.warning(f"说话人目录 {speaker_dir} 不存在")
+        return spk_prompt_text_raw
+    wav_files = glob.glob(os.path.join(speaker_dir, "*.wav"))
+    for wav_path in wav_files:
+        filename = os.path.basename(wav_path)
+        match = re.match(r"\[(.+?)\](.+)\.wav$", filename)
+        if match:
+            speaker_name = match.group(1)
+            prompt_text = match.group(2)
+            spk_prompt_text_raw[speaker_name] = prompt_text
+    return spk_prompt_text_raw
+
+
+@app.get("/")
+async def index():
+    index_path = os.path.join(os.path.dirname(__file__), "static", "index.html")
+    if os.path.exists(index_path):
+        return FileResponse(index_path)
+    return {
+        "message": "FastCosyVoice3 TTS Server (TensorRT-LLM Accelerated) is running. Visit /static/index.html for the web interface.",
+    }
+
+
+@app.get("/api/speakers")
+async def get_speakers():
+    try:
+        speakers = fast_cosyvoice.list_available_spks()
+        return JSONResponse(content={"speakers": speakers})
+    except Exception as e:
+        logging.error(f"获取说话人列表失败: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+@app.post("/tts")
+async def inference_zero_shot(request: Request, text: str = Form(), speaker: str = Form(default="")):
+    request_start_time = request.state.start_time
+    logging.info(
+        f"[FastTTS请求] 收到请求: text='{text[:50] if len(text) > 50 else text}', speaker='{speaker}'"
+    )
+    try:
+        available_spks = fast_cosyvoice.list_available_spks()
+        default_speaker = (
+            "jok老师" if "jok老师" in available_spks else (available_spks[0] if available_spks else "")
+        )
+        selected_speaker = speaker if speaker else default_speaker
+        if not selected_speaker:
+            return JSONResponse(content={"error": "没有可用的说话人"}, status_code=400)
+        logging.info(f"[FastTTS推理] 开始推理, 说话人: {selected_speaker}")
+        model_output = fast_cosyvoice.inference_zero_shot(
+            text,
+            "",
+            None,
+            zero_shot_spk_id=selected_speaker,
+            stream=True,
+            request_start_time=request_start_time,
+        )
+        return StreamingResponse(generate_data(model_output, request_start_time))
+    except Exception as e:
+        logging.error(f"FastTTS推理失败: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=50001, help="服务端口")
+    parser.add_argument(
+        "--model_dir",
+        type=str,
+        default="pretrained_models/Fun-CosyVoice3-0.5B",
+        help="模型本地路径或 modelscope 仓库 id",
+    )
+    parser.add_argument(
+        "--trtllm_engine_dir",
+        type=str,
+        default="pretrained_models/cosyvoice3_llm/trt_engines_bfloat16",
+        help="TensorRT-LLM 引擎目录",
+    )
+    parser.add_argument(
+        "--trtllm_tokenizer_dir",
+        type=str,
+        default="pretrained_models/cosyvoice3_llm",
+        help="TensorRT-LLM tokenizer 目录",
+    )
+    parser.add_argument(
+        "--speaker_dir",
+        type=str,
+        default="asset/speakers",
+        help="说话人音频文件目录",
+    )
+    args = parser.parse_args()
+
+    try:
+        logging.info("=" * 60)
+        logging.info("启动 FastCosyVoice3 TTS Server")
+        logging.info(f"模型目录: {args.model_dir}")
+        logging.info(f"TensorRT-LLM 引擎目录: {args.trtllm_engine_dir}")
+        logging.info(f"TensorRT-LLM Tokenizer: {args.trtllm_tokenizer_dir}")
+        logging.info("=" * 60)
+
+        cosyvoice = CosyVoice3(
+            args.model_dir,
+            load_trt=True,
+            fp16=False,
+        )
+        logging.info("✅ 模型加载配置: TRT=True, FP16=False")
+
+        spk2info_path = os.path.join(args.speaker_dir, "spk2info.pt")
+        fast_cosyvoice = FastCosyVoice3(
+            cosyvoice_model=cosyvoice,
+            trtllm_engine_dir=args.trtllm_engine_dir,
+            trtllm_tokenizer_dir=args.trtllm_tokenizer_dir,
+            spk2info_path=spk2info_path,
+        )
+        try:
+            fast_cosyvoice.cosyvoice.model.llm.to("cpu")
+            torch.cuda.empty_cache()
+            logging.info("已将 CosyVoice3 PyTorch LLM 移至 CPU，释放 GPU 显存")
+        except Exception as e:
+            logging.warning(f"移动 CosyVoice3 LLM 到 CPU 失败: {e}")
+        logging.info("✅ FastCosyVoice3 初始化成功，使用 TensorRT-LLM 加速")
+
+    except Exception as e:
+        raise TypeError(f"导入{args.model_dir}失败，模型类型有误！错误: {e}")
+
+    spk2info_path = os.path.join(args.speaker_dir, "spk2info.pt")
+    spk_prompt_text_raw_map = extract_spk_prompt_text_from_directory(args.speaker_dir)
+
+    need_regenerate = False
+    if os.path.exists(spk2info_path):
+        spk2info_data = torch.load(spk2info_path, map_location=fast_cosyvoice.device)
+        fast_cosyvoice.cosyvoice.frontend.spk2info.update(spk2info_data)
+        logging.info(f"已加载 spk2info.pt: {spk2info_path}")
+
+    existing_spks = set(fast_cosyvoice.cosyvoice.frontend.spk2info.keys())
+    required_spks = set(spk_prompt_text_raw_map.keys())
+
+    if not os.path.exists(spk2info_path):
+        print(f"未找到 spk2info.pt，将生成新文件")
+        need_regenerate = True
+    elif required_spks - existing_spks:
+        missing_spks = required_spks - existing_spks
+        print(f"检测到新增说话人: {missing_spks}，需要重新生成 spk2info.pt")
+        need_regenerate = True
+    else:
+        print(
+            f"spk2info.pt 已存在，包含 {len(existing_spks)} 个说话人，跳过特征提取"
+        )
+
+    if need_regenerate:
+        print("正在提取说话人音频特征...")
+        speakers_data = load_speakers_from_directory(args.speaker_dir)
+        if not speakers_data:
+            print(f"警告：未在 {args.speaker_dir} 目录找到任何说话人文件")
+        else:
+            print(f"成功加载 {len(speakers_data)} 个说话人")
+            for speaker_name, speaker_info in speakers_data.items():
+                try:
+                    fast_cosyvoice.add_zero_shot_spk(
+                        speaker_info["prompt_text"],
+                        speaker_info["prompt_speech_16k"],
+                        speaker_name,
+                    )
+                    print(f"  ✓ {speaker_name}")
+                except Exception as e:
+                    print(f"  ✗ {speaker_name}: {e}")
+            try:
+                os.makedirs(args.speaker_dir, exist_ok=True)
+                fast_cosyvoice.save_spkinfo()
+                print(f"说话人信息已保存到 {spk2info_path}")
+            except Exception as e:
+                print(f"保存说话人信息失败: {e}")
+    else:
+        fast_cosyvoice.load_spk_prompt_text_raw(spk_prompt_text_raw_map)
+        print(f"已从文件名加载 {len(spk_prompt_text_raw_map)} 个说话人的 prompt_text 映射")
+
+    print("\n正在预热模型...")
+    available_spks = fast_cosyvoice.list_available_spks()
+    if available_spks:
+        warmup_speaker = "jok老师" if "jok老师" in available_spks else available_spks[0]
+        print(f"使用 '{warmup_speaker}' 进行预热")
+        warmup_texts = [
+            "你好。",
+            "这是一个用于预热模型的测试句子，确保服务响应速度。",
+            "语音合成服务正在启动中，请稍候，系统正在进行初始化操作。",
+            "好的，没问题。",
+        ]
+        for t in warmup_texts:
+            try:
+                for _ in fast_cosyvoice.inference_zero_shot(
+                    t, "", None, zero_shot_spk_id=warmup_speaker, stream=True
+                ):
+                    pass
+            except Exception as e:
+                print(f"预热失败: {e}")
+                break
+    else:
+        print("未找到可用说话人，跳过预热")
+
+    print("预热完毕\n")
+    print("=" * 60)
+    print(f"🚀 FastCosyVoice3 TTS Server 启动在端口 {args.port}")
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=args.port,
+        timeout_keep_alive=60,
+        limit_concurrency=100,
+        backlog=2048,
+    )

@@ -46,7 +46,10 @@ compile_commands.json
 # *.m4a
 # *.aac
 # *.pt
+
 pretrained_models/*
+!pretrained_models/.gitkeep
+test_output/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
