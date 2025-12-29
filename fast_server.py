@@ -271,8 +271,10 @@ class TextNormalizer:
                     text = spell_out_number(text, self.inflect_parser)
         
         # 使用 split_paragraph 进行智能分段（与 frontend.py 逻辑一致）
-        tokenize_fn = partial(self.tokenizer.encode, allowed_special='all')
-        
+        # HuggingFace tokenizer 不支持 allowed_special 参数，这里只需要返回 token 列表用于长度统计
+        def tokenize_fn(_text: str):
+            return self.tokenizer.encode(_text, add_special_tokens=False)
+         
         if contains_chinese(text):
             texts = list(split_paragraph(
                 text, tokenize_fn, "zh", 
