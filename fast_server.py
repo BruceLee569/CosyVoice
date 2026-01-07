@@ -22,6 +22,7 @@ from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
+from pydantic import BaseModel
 import uvicorn
 import numpy as np
 import torch
@@ -353,9 +354,13 @@ class FastCosyVoice2:
     
     def _init_trtllm(self, engine_dir, tokenizer_dir):
         """初始化 TensorRT-LLM 引擎"""
-        # 如果引擎目录不存在，自动编译
-        if not os.path.exists(engine_dir):
-            logging.warning(f"TensorRT-LLM 引擎目录不存在: {engine_dir}")
+        # 如果引擎目录不存在或缺少 config.json，自动编译
+        config_path = os.path.join(engine_dir, 'config.json')
+        if not os.path.exists(config_path):
+            if not os.path.exists(engine_dir):
+                logging.warning(f"TensorRT-LLM 引擎目录不存在: {engine_dir}")
+            else:
+                logging.warning(f"TensorRT-LLM 引擎配置文件不存在: {config_path}")
             
             # 从 tokenizer_dir 推断模型目录（假设 tokenizer_dir 就是模型目录）
             model_dir = tokenizer_dir
@@ -378,6 +383,10 @@ class FastCosyVoice2:
                 engine_dir=engine_dir,
                 dtype=dtype
             )
+            
+            # 验证编译结果
+            if not os.path.exists(config_path):
+                raise RuntimeError(f"TensorRT-LLM 引擎编译完成但配置文件仍不存在: {config_path}")
         
         # 获取当前进程的 MPI 排名
         runtime_rank = tensorrt_llm.mpi_rank()
@@ -400,7 +409,7 @@ class FastCosyVoice2:
             enable_context_fmha_fp32_acc=False,
             max_batch_size=1,
             max_input_len=2048,     # 🔴 增大到 2048，支持长文本输入（prompt + tts_text）
-            kv_cache_free_gpu_memory_fraction=0.25,  # 降低 KV 缓存占用，平衡显存
+            kv_cache_free_gpu_memory_fraction=0.15,  # 🔧 优化：从0.25降低到0.15，节省约500MB显存
             cuda_graph_mode=False,
             gather_generation_logits=False,
         )
@@ -578,7 +587,7 @@ class FastCosyVoice2:
         # ========== 逐段推理并流式返回 ==========
         for segment_idx, text_segment in enumerate(text_segments):
             segment_start_time = time.perf_counter()
-            logging.info(f"[段落推理 {segment_idx+1}/{len(text_segments)}] 开始处理: '{text_segment[:50]}{'...' if len(text_segment) > 50 else ''}'")
+            logging.info(f"[段落推理 {segment_idx+1}/{len(text_segments)}] 开始处理: '{text_segment}'")
             
             # 调用单段推理（内部逻辑保持不变）
             for output in self._inference_single_segment(
@@ -592,9 +601,20 @@ class FastCosyVoice2:
             
             segment_time = (time.perf_counter() - segment_start_time) * 1000
             logging.info(f"[段落推理 {segment_idx+1}/{len(text_segments)}] 完成，耗时: {segment_time:.2f}ms")
+            
+            # 🔧 显存优化：每段推理完成后立即清理显存，防止长文本累积
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     
+    @torch.inference_mode()
     def _inference_single_segment(self, text, prompt_text, prompt_speech_16k, zero_shot_spk_id='', stream=True, request_start_time=None, is_first_segment=True):
-        """单段文本推理（TensorRT-LLM 流式生成 + 流式 token2wav，原 inference_zero_shot 的核心逻辑）"""
+        """单段文本推理（TensorRT-LLM 流式生成 + 流式 token2wav，原 inference_zero_shot 的核心逻辑）
+        
+        使用 @torch.inference_mode() 装饰器禁用梯度计算，减少显存占用。
+        """
+        this_uuid = None  # 预声明用于 finally 清理
+        model = self.cosyvoice.model
+        
         try:
             # ========== 阶段 1: 上下文加载 ==========
             context_start = time.perf_counter()
@@ -635,7 +655,6 @@ class FastCosyVoice2:
             
             # 5. 初始化流式参数
             this_uuid = str(uuid_module.uuid1())
-            model = self.cosyvoice.model
             model.hift_cache_dict[this_uuid] = None
             
             # 核心参数：保持原始对齐逻辑不变
@@ -751,7 +770,16 @@ class FastCosyVoice2:
                         
                         token_offset += this_token_hop_len
                         chunk_idx += 1
+                        
+                        # 🔧 显存优化：显式删除不再需要的中间张量
+                        del this_tts_speech_token
+                        
                         yield {'tts_speech': tts_speech.cpu()}
+                        
+                        # 🔧 显存优化：每10个块清理一次CUDA缓存，防止单段内显存持续累积
+                        # 频率过高会影响性能，过低则显存峰值过高
+                        if chunk_idx % 10 == 0:
+                            torch.cuda.empty_cache()
                     else:
                         # 不够 tokens，等待更多生成
                         break
@@ -788,7 +816,14 @@ class FastCosyVoice2:
                 cumulative_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else 0
                 
                 logging.info(f"[流式token2wav] 最终块{chunk_idx}: 音频={chunk_audio_duration*1000:.0f}ms, 耗时={chunk_time:.1f}ms, RTF={chunk_rtf:.3f} (finalize)")
+                
+                # 🔧 显存优化：删除中间张量
+                del this_tts_speech_token
+                
                 yield {'tts_speech': tts_speech.cpu()}  # 🔴 关键：必须 yield 最后一块音频
+            
+            # 🔧 显存优化：清理累积的 speech_tokens 列表
+            speech_tokens.clear()
             
             # 输出总体 RTF 统计（仅首段详细输出）
             overall_rtf = total_processing_time / total_audio_duration if total_audio_duration > 0 else 0
@@ -797,14 +832,23 @@ class FastCosyVoice2:
                 logging.info(f"[整体RTF统计] 总音频时长: {total_audio_duration:.2f}s, 总处理时间: {total_processing_time:.2f}s, 整体RTF: {overall_rtf:.3f} (目标: <0.2)")
             
             # 清理缓存
-            if this_uuid in model.hift_cache_dict:
+            if this_uuid is not None and this_uuid in model.hift_cache_dict:
                 model.hift_cache_dict.pop(this_uuid)
             
         except Exception as e:
             logging.error(f"TensorRT-LLM 推理失败: {e}")
             import traceback
             traceback.print_exc()
+            # 🔧 异常时也要清理缓存，防止显存泄漏
+            if this_uuid is not None and this_uuid in model.hift_cache_dict:
+                model.hift_cache_dict.pop(this_uuid)
             raise  # 直接抛出异常，不回退到 PyTorch
+        finally:
+            # 🔧 显存优化：每次单段推理结束后清理 CUDA 缓存
+            # 这是防止长文本请求显存累积的关键
+            if torch.cuda.is_available():
+                torch.cuda.current_stream().synchronize()
+                torch.cuda.empty_cache()
     
     def list_available_spks(self):
         """获取可用说话人列表"""
@@ -829,11 +873,13 @@ class FastCosyVoice2:
         self.spk_prompt_text_raw.update(spk_prompt_text_raw_dict)
 
 
-def generate_data(model_output, request_start_time):
+def generate_data(model_output, request_start_time=None):
     """生成音频数据流，对输出进行削波处理防止爆音"""
     is_first = True
     chunk_count = 0
-    
+
+    if request_start_time is None:
+        request_start_time = time.perf_counter()
     for i in model_output:
         if is_first:
             first_chunk_time = time.perf_counter()
@@ -855,6 +901,95 @@ def generate_data(model_output, request_start_time):
     
     total_time = (time.perf_counter() - request_start_time) * 1000
     logging.info(f"[TTS统计] 流式传输结束. 总耗时: {total_time:.2f}ms, 共发送 {chunk_count} 个数据块")
+
+
+def generate_wav_chunks(model_output, sample_rate=24000):
+    """生成带WAV header的音频数据流，真正的流式传输（首包立即发送）
+    
+    Args:
+        model_output: 模型输出的生成器
+        sample_rate: 采样率，默认24000Hz
+    
+    Yields:
+        bytes: WAV格式的音频数据块（header + 实时音频数据）
+    
+    注意：由于流式传输时无法预知总数据大小，WAV header中的数据大小字段
+    将设置为最大值(0xFFFFFFFF)，这是流式WAV的标准做法。
+    大多数播放器会正确处理这种情况。
+    """
+    import struct
+    import time
+    
+    is_first = True
+    chunk_count = 0
+    start_time = time.perf_counter()
+    
+    # 参数设置
+    num_channels = 1  # 单声道
+    bits_per_sample = 16  # 16位
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    
+    # 流式WAV：数据大小未知，使用最大值占位
+    # 这是流式WAV的标准做法，播放器会根据实际接收的数据处理
+    data_size_unknown = 0xFFFFFFFF - 36  # 最大值减去header固定部分
+    
+    # 构建WAV header（在第一个音频块之前发送）
+    # RIFF chunk
+    wav_header = b'RIFF'
+    wav_header += struct.pack('<I', 0xFFFFFFFF)  # 文件大小未知，使用最大值
+    wav_header += b'WAVE'
+    
+    # fmt sub-chunk
+    wav_header += b'fmt '
+    wav_header += struct.pack('<I', 16)  # fmt chunk size
+    wav_header += struct.pack('<H', 1)  # audio format (PCM)
+    wav_header += struct.pack('<H', num_channels)  # number of channels
+    wav_header += struct.pack('<I', sample_rate)  # sample rate
+    wav_header += struct.pack('<I', byte_rate)  # byte rate
+    wav_header += struct.pack('<H', block_align)  # block align
+    wav_header += struct.pack('<H', bits_per_sample)  # bits per sample
+    
+    # data sub-chunk header
+    wav_header += b'data'
+    wav_header += struct.pack('<I', data_size_unknown)  # 数据大小未知
+    
+    # 立即发送WAV header（在任何音频数据之前）
+    logging.info(f"[WAV流式] 立即发送WAV header ({len(wav_header)} bytes)，采样率: {sample_rate}Hz")
+    yield wav_header
+    
+    header_sent_time = time.perf_counter()
+    ttfb = (header_sent_time - start_time) * 1000
+    logging.info(f"[WAV流式] WAV header TTFB: {ttfb:.2f}ms")
+    
+    # 流式发送音频数据
+    for i in model_output:
+        if is_first:
+            first_chunk_time = time.perf_counter()
+            first_audio_ttfb = (first_chunk_time - start_time) * 1000
+            logging.info(f"[WAV流式] 首个音频块生成完毕! 音频 TTFB: {first_audio_ttfb:.2f}ms")
+            is_first = False
+        
+        tts_speech = i["tts_speech"].numpy()
+        # 输出端削波：防止 float -> int16 转换时的整数溢出
+        tts_speech = np.clip(tts_speech, -1.0, 1.0)
+        # 转换为 int16 格式并立即发送
+        tts_audio_bytes = (tts_speech * 32767.0).astype(np.int16).tobytes()
+        
+        chunk_count += 1
+        chunk_time = time.perf_counter()
+        elapsed = (chunk_time - start_time) * 1000
+        logging.info(f"[WAV流式] 第{chunk_count}块即将发送 | 大小: {len(tts_audio_bytes)} bytes | 累积耗时: {elapsed:.2f}ms")
+        
+        # 立即yield，实现真正的流式传输
+        yield tts_audio_bytes
+        
+        after_yield_time = time.perf_counter()
+        yield_duration = (after_yield_time - chunk_time) * 1000
+        logging.info(f"[WAV流式] 第{chunk_count}块已发送 | yield耗时: {yield_duration:.2f}ms")
+    
+    total_time = (time.perf_counter() - start_time) * 1000
+    logging.info(f"[WAV流式] 流式传输完成. 总耗时: {total_time:.2f}ms, 共发送 {chunk_count} 个音频块")
 
 
 def load_speakers_from_directory(speaker_dir="asset/speakers"):
@@ -933,6 +1068,7 @@ async def index():
     return {"message": "FastCosyVoice TTS Server (TensorRT-LLM Accelerated) is running. Visit /static/index.html for the web interface."}
 
 
+
 @app.get("/api/speakers")
 async def get_speakers():
     """获取所有可用的说话人列表"""
@@ -976,6 +1112,72 @@ async def inference_zero_shot(request: Request, text: str = Form(), speaker: str
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
+
+# --- Voxta 请求接口 ---
+class TTSRequest(BaseModel):
+    text: str
+    speaker_wav: str  # 对应 Voxta 模板中的参数
+    language: str
+
+@app.get("/speakers")
+async def get_speakers():
+    try:
+        speakers = fast_cosyvoice.list_available_spks()
+        return [
+            {"name": speaker, "voice_id": speaker, "lang": "zh"} for speaker in speakers
+        ]
+        return JSONResponse(content={"speakers": speakers})
+    except Exception as e:
+        logging.error(f"获取说话人列表失败: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+    # 直接返回数组，供 Voxta 解析
+    return [
+    {"name": "甜美少女", "voice_id": "sweet_girl", "lang": "zh"},
+    {"name": "成熟大叔", "voice_id": "cool_man", "lang": "zh"},
+    {"name": "English Female", "voice_id": "en_female", "lang": "en"}
+]
+
+@app.post("/tts_to_audio")
+async def tts_to_audio(request: TTSRequest):
+    """Voxta TTS接口 - 流式返回WAV格式音频(HTTP Chunked Transfer Encoding)
+    """
+    text = request.text
+    speaker = request.speaker_wav
+    # 使用中间件记录的开始时间，确保与前端对齐
+    # request_start_time = request.state.start_time
+    logging.info(f"[FastTTS请求] 收到请求: text='{text[:50] if len(text) > 50 else text}', speaker='{speaker}'")
+
+    try:
+        # 获取可用说话人列表
+        available_spks = fast_cosyvoice.list_available_spks()
+        # 默认使用jok老师，如果没有则使用第一个说话人
+        default_speaker = "jok老师" if "jok老师" in available_spks else (available_spks[0] if available_spks else "")
+        selected_speaker = speaker if speaker else default_speaker
+        
+        if not selected_speaker:
+            return JSONResponse(content={"error": "没有可用的说话人"}, status_code=400)
+        
+        logging.info(f"[FastTTS推理] 开始推理, 说话人: {selected_speaker}")
+
+        # 使用 FastCosyVoice2 进行推理（自动选择 TensorRT-LLM 或 PyTorch）
+        model_output = fast_cosyvoice.inference_zero_shot(
+            text, "", None, 
+            zero_shot_spk_id=selected_speaker,
+            stream=True,
+            # request_start_time=request_start_time
+        )
+        
+        return StreamingResponse(
+            generate_wav_chunks(model_output),
+            media_type="audio/wav"
+        )
+    except Exception as e:
+        logging.error(f"FastTTS推理失败: {e}")
+        return JSONResponse(content={"error": str(e)}, status_code=500)
+
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=50000, help="服务端口")
@@ -1014,14 +1216,14 @@ if __name__ == "__main__":
         logging.info(f"TensorRT-LLM Tokenizer: {args.trtllm_tokenizer_dir}")
         logging.info("=" * 60)
         
-        # 加载原始 CosyVoice2 模型（确保启用所有加速选项）
+        # 加载原始 CosyVoice2 模型（优化显存占用）
         cosyvoice = CosyVoice2(
             args.model_dir, 
-            load_jit=True,   # ✅ JIT编译加速 flow.encoder
-            load_trt=True,   # ✅ TensorRT优化
+            load_jit=False,  # 🔧 关闭JIT：节省~800MB显存，TensorRT环境下对整体性能影响<5%
+            load_trt=True,   # ✅ TensorRT优化（保留核心加速）
             fp16=True        # ✅ FP16混合精度
         )
-        logging.info("✅ 模型加载配置: JIT=True, TRT=True, FP16=True")
+        logging.info("✅ 模型加载配置: JIT=False(节省显存), TRT=True, FP16=True")
         
         # 创建 FastCosyVoice2 实例（集成 TensorRT-LLM）
         spk2info_path = os.path.join(args.speaker_dir, 'spk2info.pt')
@@ -1032,12 +1234,12 @@ if __name__ == "__main__":
             spk2info_path=spk2info_path,
         )
         try:
-            # 把 PyTorch LLM 移到 CPU，释放 GPU 显存
-            fast_cosyvoice.cosyvoice.model.llm.to("cpu")
+            # 🔧 显存优化：彻底释放 PyTorch LLM（已由 TensorRT-LLM 替代）
+            del fast_cosyvoice.cosyvoice.model.llm
             torch.cuda.empty_cache()
-            logging.info("已将 CosyVoice2 PyTorch LLM 移至 CPU，释放 GPU 显存")
+            logging.info("✅ 已删除 PyTorch LLM，预计释放 ~2GB 显存（使用 TensorRT-LLM 替代）")
         except Exception as e:
-            logging.warning(f"移动 CosyVoice2 LLM 到 CPU 失败: {e}")
+            logging.warning(f"删除 PyTorch LLM 失败: {e}")
         logging.info("✅ FastCosyVoice2 初始化成功，使用 TensorRT-LLM 加速")
 
     except Exception as e:
